@@ -40,13 +40,15 @@ class FakeSandbox:
 
     def __init__(self, *, extract_exit_code: int = 0) -> None:
         self.uploaded: list[tuple[str, bytes]] = []
+        self.extract_calls: list[tuple[str, str]] = []
         self.destroyed = False
         self._extract_exit_code = extract_exit_code
 
     async def upload_bytes(self, dest_path: str, content: bytes) -> None:
         self.uploaded.append((dest_path, content))
 
-    async def exec(self, command: str, *, cwd=None, timeout_s=None) -> _ExecResult:
+    async def extract_archive(self, archive_path: str, dest_dir: str) -> _ExecResult:
+        self.extract_calls.append((archive_path, dest_dir))
         stderr = "extraction failed" if self._extract_exit_code else ""
         return _ExecResult(exit_code=self._extract_exit_code, stderr=stderr)
 

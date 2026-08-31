@@ -21,11 +21,15 @@ same `ISandbox`/`ISandboxFactory` Protocols.
 
 `exec()` here does not run an arbitrary shell. AIDA-MATE's own code is the only
 caller — the LLM only ever supplies tool *arguments* (a path, a search
-pattern), never a raw command string — and it only ever issues one of three
-fixed command shapes: the archive-extraction line built in
-`app/agents/orchestrator.py`, and the `find`/`grep` templates built in
-`app/tools/sandbox_tools.py`. Each is recognized and given a native Python
-implementation; anything else is rejected rather than silently mishandled.
+pattern), never a raw command string — and it only ever issues one of the two
+fixed `find`/`grep` command shapes built in `app/tools/sandbox_tools.py`. Each
+is recognized and given a native Python implementation; anything else is
+rejected rather than silently mishandled. Archive extraction is a separate,
+first-class `extract_archive` method rather than a third recognized `exec()`
+shape — it never went through a shell here either, but exposing it as its own
+method (mirroring `SbxSandbox.extract_archive`) keeps both backends' "no
+shell `tar`" contract explicit at the `ISandbox` interface level rather than
+only true by accident of what each backend's `exec()` happens to recognize.
 
 Known limitation: paths or search patterns containing a literal space are
 not reconstructed with full POSIX-shell fidelity by the regexes below (real
@@ -44,7 +48,6 @@ from pathlib import Path, PurePosixPath
 
 from app.core.logging import get_logger
 from app.services.sandbox_service import SandboxExecResult
-from app.tools.sandbox_tools import SANDBOX_REPO_DIR
 
 logger = get_logger(__name__)
 
@@ -52,10 +55,6 @@ logger = get_logger(__name__)
 #: same fixed, non-configurable filename the downloaded archive is written
 #: to inside the sandbox workspace.
 _ARCHIVE_FILENAME = "archive.tar.gz"
-
-_EXTRACT_COMMAND = (
-    f"mkdir -p {SANDBOX_REPO_DIR} && tar -xzf {_ARCHIVE_FILENAME} -C {SANDBOX_REPO_DIR} --strip-components=1"
-)
 
 _FIND_RE = re.compile(r"^find (?P<target>.+?) -maxdepth (?P<depth>\d+) -type f \| head -n (?P<limit>\d+)$")
 _GREP_RE = re.compile(r"^grep -rn -F (?P<rest>.+) \| head -n (?P<limit>\d+)$")
@@ -101,8 +100,6 @@ class LocalSandbox:
         """Recognize and natively execute one of AIDA-MATE's own fixed command shapes."""
         effective_cwd = Path(cwd) if cwd is not None else self._workspace.resolve()
 
-        if command == _EXTRACT_COMMAND:
-            return await asyncio.to_thread(self._extract_archive, effective_cwd)
         if match := _FIND_RE.match(command):
             return await asyncio.to_thread(self._find_files, effective_cwd, match)
         if match := _GREP_RE.match(command):
@@ -127,11 +124,13 @@ class LocalSandbox:
                 extra={"sandbox_id": self.id, "error": str(exc)},
             )
 
-    # -- exec() command implementations --------------------------------------
+    async def extract_archive(self, archive_path: str, dest_dir: str) -> SandboxExecResult:
+        """Extract the `.tar.gz` at `archive_path` into `dest_dir`. See `ISandbox.extract_archive`."""
+        archive_file = self._resolve_workspace_path(archive_path)
+        dest = self._resolve_workspace_path(dest_dir)
+        return await asyncio.to_thread(self._extract_archive, archive_file, dest)
 
-    def _extract_archive(self, cwd: Path) -> SandboxExecResult:
-        dest = cwd / SANDBOX_REPO_DIR
-        archive_path = cwd / _ARCHIVE_FILENAME
+    def _extract_archive(self, archive_path: Path, dest: Path) -> SandboxExecResult:
         dest.mkdir(parents=True, exist_ok=True)
         try:
             with tarfile.open(archive_path, "r:gz") as tar:
@@ -146,6 +145,8 @@ class LocalSandbox:
         except (tarfile.TarError, OSError) as exc:
             return SandboxExecResult(exit_code=1, stdout="", stderr=str(exc))
         return SandboxExecResult(exit_code=0, stdout="", stderr="")
+
+    # -- exec() command implementations --------------------------------------
 
     def _find_files(self, cwd: Path, match: re.Match) -> SandboxExecResult:
         tokens = _split_shell_words(match.group("target"))

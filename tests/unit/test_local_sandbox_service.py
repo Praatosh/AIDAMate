@@ -13,7 +13,6 @@ import pytest
 
 from app.services.local_sandbox_service import (
     _ARCHIVE_FILENAME,
-    _EXTRACT_COMMAND,
     LocalSandbox,
     LocalSandboxFactory,
 )
@@ -88,14 +87,14 @@ async def test_read_file_truncates_to_max_bytes(sandbox: LocalSandbox) -> None:
     assert len(await sandbox.read_file("big.txt", max_bytes=10)) == 10
 
 
-# --- exec(): archive extraction --------------------------------------------------
+# --- extract_archive() ------------------------------------------------------------
 
 
-async def test_exec_extracts_archive_and_strips_the_top_level_directory(sandbox: LocalSandbox) -> None:
+async def test_extract_archive_strips_the_top_level_directory(sandbox: LocalSandbox) -> None:
     archive = _make_tarball({"README.md": b"# hi", "app/main.py": b"print('hi')"})
     await sandbox.upload_bytes(_ARCHIVE_FILENAME, archive)
 
-    result = await sandbox.exec(_EXTRACT_COMMAND)
+    result = await sandbox.extract_archive(_ARCHIVE_FILENAME, SANDBOX_REPO_DIR)
 
     assert result.exit_code == 0
     extracted = sandbox._resolve_workspace_path(SANDBOX_REPO_DIR)
@@ -104,8 +103,8 @@ async def test_exec_extracts_archive_and_strips_the_top_level_directory(sandbox:
     assert not (extracted / "acme-api-3f2c9ab").exists()
 
 
-async def test_exec_extraction_reports_a_missing_archive(sandbox: LocalSandbox) -> None:
-    result = await sandbox.exec(_EXTRACT_COMMAND)
+async def test_extract_archive_reports_a_missing_archive(sandbox: LocalSandbox) -> None:
+    result = await sandbox.extract_archive(_ARCHIVE_FILENAME, SANDBOX_REPO_DIR)
 
     assert result.exit_code != 0
 

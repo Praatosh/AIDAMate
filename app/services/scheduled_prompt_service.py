@@ -18,10 +18,6 @@ from app.tools.sandbox_tools import SANDBOX_REPO_DIR
 logger = get_logger(__name__)
 
 _ARCHIVE_FILENAME = "archive.tar.gz"
-_EXTRACT_COMMAND = (
-    f"mkdir -p {SANDBOX_REPO_DIR} && "
-    f"tar -xzf {_ARCHIVE_FILENAME} -C {SANDBOX_REPO_DIR} --strip-components=1"
-)
 
 #: Bounds both the extract command and the agent run — the same value
 #: `ReviewOrchestrator` uses `agent_timeout_s` for on the extract step, and
@@ -98,7 +94,7 @@ class ScheduledPromptService:
             try:
                 archive = await self._github.download_archive(repo, sha)
                 await sandbox.upload_bytes(_ARCHIVE_FILENAME, archive)
-                extract_result = await sandbox.exec(_EXTRACT_COMMAND, timeout_s=_RUN_TIMEOUT_SECONDS)
+                extract_result = await sandbox.extract_archive(_ARCHIVE_FILENAME, SANDBOX_REPO_DIR)
                 if extract_result.exit_code != 0:
                     raise AidaMateError(
                         f"Failed to extract repository archive: {extract_result.stderr}"

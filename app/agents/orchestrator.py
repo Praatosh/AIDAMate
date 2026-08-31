@@ -81,15 +81,12 @@ logger = get_logger(__name__)
 _ARCHIVE_FILENAME = "archive.tar.gz"
 
 #: GitHub tarballs wrap their content in one top-level `owner-repo-sha/`
-#: directory; stripping it is what makes in-sandbox paths match
-#: `ChangedFile.filename` (e.g. `app/auth/middleware.py`, not
-#: `acme-api-3f2c9ab/app/auth/middleware.py`). Standard GitHub tarball
-#: layout — not one of the `sbx` CLI facts verified this session,
-#: worth a real-download sanity check before relying on it in production.
-_EXTRACT_COMMAND = (
-    f"mkdir -p {SANDBOX_REPO_DIR} && "
-    f"tar -xzf {_ARCHIVE_FILENAME} -C {SANDBOX_REPO_DIR} --strip-components=1"
-)
+#: directory; `ISandbox.extract_archive` strips it, which is what makes
+#: in-sandbox paths match `ChangedFile.filename` (e.g.
+#: `app/auth/middleware.py`, not `acme-api-3f2c9ab/app/auth/middleware.py`).
+#: Standard GitHub tarball layout — not one of the `sbx` CLI facts verified
+#: this session, worth a real-download sanity check before relying on it in
+#: production.
 
 
 class ReviewOrchestrator:
@@ -315,7 +312,7 @@ class ReviewOrchestrator:
             )
             await sandbox.upload_bytes(_ARCHIVE_FILENAME, archive)
 
-            extract_result = await sandbox.exec(_EXTRACT_COMMAND, timeout_s=self._agent_timeout_s)
+            extract_result = await sandbox.extract_archive(_ARCHIVE_FILENAME, SANDBOX_REPO_DIR)
             if extract_result.exit_code != 0:
                 raise AidaMateError(
                     f"Archive extraction failed (exit {extract_result.exit_code}): "

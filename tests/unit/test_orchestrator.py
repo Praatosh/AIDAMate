@@ -88,25 +88,30 @@ class FakeGitHub:
 
 
 class FakeSandbox:
-    """Records calls; scripts exec() results; never touches a real subprocess."""
+    """Records calls; scripts extract_archive() results; never touches a real subprocess."""
 
     id = "fake-sandbox-id"
 
     def __init__(self) -> None:
         self.uploaded: list[tuple[str, bytes]] = []
         self.exec_calls: list[str] = []
+        self.extract_calls: list[tuple[str, str]] = []
         self.destroyed = False
-        self._exec_exit_code = 0
+        self._extract_exit_code = 0
 
     def script_extract_failure(self) -> None:
-        self._exec_exit_code = 1
+        self._extract_exit_code = 1
 
     async def upload_bytes(self, dest_path: str, content: bytes) -> None:
         self.uploaded.append((dest_path, content))
 
     async def exec(self, command: str, *, cwd=None, timeout_s=None):
         self.exec_calls.append(command)
-        return _FakeExecResult(self._exec_exit_code)
+        return _FakeExecResult(0)
+
+    async def extract_archive(self, archive_path: str, dest_dir: str):
+        self.extract_calls.append((archive_path, dest_dir))
+        return _FakeExecResult(self._extract_exit_code)
 
     async def read_file(self, path: str, *, max_bytes: int = 200_000) -> str:
         return ""
@@ -702,7 +707,7 @@ async def test_sandbox_lifecycle_calls_happen_in_order(repo) -> None:
     assert job.sandbox_id == sandbox.id
     assert sandbox.uploaded[0][0] == "archive.tar.gz"
     assert sandbox.uploaded[0][1] == b"fake-archive-bytes"
-    assert any("tar -xzf" in call for call in sandbox.exec_calls)
+    assert sandbox.extract_calls == [("archive.tar.gz", "repo")]
     assert sandbox.destroyed is True
     assert agent.analyze_calls[0][1] is sandbox
 

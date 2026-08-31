@@ -20,6 +20,11 @@ The real command surface, confirmed this session:
 `upload_bytes`/`read_file` operate on that mounted directory directly rather
 than shelling out to copy anything — unchanged from the previous adapter.
 There is still no `cp`-based transfer needed for this app's use case.
+`extract_archive` joins that pair: it extracts the downloaded PR/repo
+archive with Python's own `tarfile` (`filter="data"`) directly against the
+mounted workspace, rather than shelling `sh -c "tar -xzf ..."` into the
+container the way the previous version of this adapter did — no shell
+`tar` invocation is on this path anymore.
 
 One live-verified, Windows-specific gotcha `exec()` accounts for: the
 container does NOT mount the workspace at the literal host path. On this
@@ -51,11 +56,13 @@ mounts a real project directory from this host.
 """
 
 import asyncio
+import contextlib
 import shutil
+import tarfile
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from app.core.errors import SandboxTimeoutError, SandboxUnavailableError
 from app.core.logging import get_logger
@@ -168,6 +175,41 @@ class SbxSandbox:
             return ""
         return data[:max_bytes].decode(errors="replace")
 
+    async def extract_archive(self, archive_path: str, dest_dir: str) -> SandboxExecResult:
+        """Extract the `.tar.gz` at `archive_path` into `dest_dir`, both host-side.
+
+        Bypasses `exec`/the container's own `tar` entirely — like
+        `upload_bytes`/`read_file`, this operates directly on the sandbox's
+        bind-mounted workspace directory as a plain host path. Uses `tarfile`
+        with `filter="data"` (PEP 706 safe extraction: rejects `..`-escaping
+        members, absolute paths, and symlinks/device files that would land
+        outside `dest_dir`) rather than shelling out to `sh -c "tar -xzf ..."`
+        inside the sandbox, which gives no such guarantee. GitHub-generated
+        archives can't actually carry such members (git itself rejects `..`/
+        absolute paths in tree entries), but this removes the shell-based
+        extraction path rather than relying on that being true forever.
+        Mirrors `LocalSandbox.extract_archive`'s exact same logic.
+        """
+        archive_file = self._resolve_workspace_path(archive_path)
+        dest = self._resolve_workspace_path(dest_dir)
+        return await asyncio.to_thread(self._extract, archive_file, dest)
+
+    def _extract(self, archive_file: Path, dest: Path) -> SandboxExecResult:
+        dest.mkdir(parents=True, exist_ok=True)
+        try:
+            with tarfile.open(archive_file, "r:gz") as tar:
+                for member in tar.getmembers():
+                    # GitHub tarballs wrap content in one `owner-repo-sha/`
+                    # directory; drop it, mirroring `--strip-components=1`.
+                    parts = PurePosixPath(member.name).parts
+                    if len(parts) <= 1:
+                        continue
+                    member.name = str(PurePosixPath(*parts[1:]))
+                    tar.extract(member, dest, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            return SandboxExecResult(exit_code=1, stdout="", stderr=str(exc))
+        return SandboxExecResult(exit_code=0, stdout="", stderr="")
+
     async def destroy(self) -> None:
         """Remove the sandbox and its host-side workspace directory.
 
@@ -262,7 +304,6 @@ class SbxSandboxFactory:
             process = await asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            _stdout, stderr = await process.communicate()
         except OSError as exc:
             # The `shutil.which` check above narrows this (the binary
             # disappearing between that check and this call, a permissions
@@ -271,9 +312,39 @@ class SbxSandboxFactory:
             # this, the mkdtemp'd workspace directory would leak on every
             # such failure, and a raw OSError would reach callers expecting
             # the domain-specific SandboxUnavailableError this method
-            # otherwise always raises on failure.
+            # otherwise always raises on failure. No subprocess was ever
+            # launched here, so there is nothing for `sbx rm` to clean up.
             shutil.rmtree(workspace, ignore_errors=True)
             raise SandboxUnavailableError(f"Could not launch '{self._binary} create': {exc}") from exc
+
+        try:
+            _stdout, stderr = await process.communicate()
+        except OSError as exc:
+            # Unlike the launch failure above, the subprocess *was* started
+            # here — `sbx create` may already have provisioned a real
+            # sandbox under `name` on the daemon side even though reading
+            # its output then failed (e.g. a broken pipe). A bare workspace
+            # cleanup would leak that sandbox, so this also stops the local
+            # process and best-effort asks `sbx` to remove whatever it may
+            # have created, mirroring `destroy()`'s own best-effort `sbx rm`.
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await process.wait()
+            with contextlib.suppress(Exception):
+                cleanup = await asyncio.create_subprocess_exec(
+                    self._binary,
+                    "rm",
+                    name,
+                    "--force",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await cleanup.wait()
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise SandboxUnavailableError(
+                f"Could not read output of '{self._binary} create': {exc}"
+            ) from exc
 
         if process.returncode != 0:
             shutil.rmtree(workspace, ignore_errors=True)

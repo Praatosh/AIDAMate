@@ -8,6 +8,8 @@ module docstring.
 """
 
 import asyncio
+import io
+import tarfile
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -15,6 +17,17 @@ import pytest
 
 from app.core.errors import SandboxTimeoutError, SandboxUnavailableError
 from app.services.sandbox_service import SbxSandbox, SbxSandboxFactory
+
+
+def _make_tarball(files: dict[str, bytes], *, top_level_dir: str = "acme-api-3f2c9ab") -> bytes:
+    """Build a `.tar.gz` shaped like a real GitHub archive: one wrapper directory."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        for relative_path, content in files.items():
+            info = tarfile.TarInfo(name=f"{top_level_dir}/{relative_path}")
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buffer.getvalue()
 
 
 def _fake_process(returncode: int = 0, stdout: bytes = b"", stderr: bytes = b""):
@@ -162,6 +175,84 @@ async def test_create_raises_sandbox_unavailable_when_the_subprocess_fails_to_la
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_create_cleans_up_via_sbx_rm_when_communicate_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Regression: unlike a launch failure (no subprocess ever started),
+    `communicate()` raising OSError happens *after* `sbx create` was
+    launched — the daemon may already have provisioned a real sandbox under
+    `name` even though reading the local process's output then failed. A
+    bare workspace cleanup would leak that sandbox, so this must also kill/
+    reap the local process and best-effort issue `sbx rm NAME --force`
+    before removing the workspace directory."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
+    calls: list[list[str]] = []
+    killed = []
+
+    create_process = AsyncMock()
+
+    async def raise_oserror():
+        raise OSError("broken pipe")
+
+    create_process.communicate = raise_oserror
+    create_process.kill = lambda: killed.append(True)
+    create_process.wait = AsyncMock(return_value=None)
+    rm_process = _fake_process(returncode=0)
+
+    async def fake_subprocess_exec(*argv, **kwargs):
+        calls.append(list(argv))
+        return create_process if len(calls) == 1 else rm_process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
+
+    with pytest.raises(SandboxUnavailableError) as exc_info:
+        await factory.create()
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert killed == [True]
+    assert len(calls) == 2
+    name = calls[0][-1]
+    assert calls[0][:2] == ["sbx", "create"]
+    assert calls[1] == ["sbx", "rm", name, "--force"]
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_create_communicate_failure_cleanup_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The `sbx rm` cleanup attempt above is itself best-effort: if it also
+    fails to launch, the original OSError still surfaces as
+    SandboxUnavailableError rather than a raw, unrelated exception from the
+    cleanup path masking it."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
+    calls: list[list[str]] = []
+
+    create_process = AsyncMock()
+
+    async def raise_oserror():
+        raise OSError("broken pipe")
+
+    create_process.communicate = raise_oserror
+    create_process.kill = lambda: None
+    create_process.wait = AsyncMock(return_value=None)
+
+    async def fake_subprocess_exec(*argv, **kwargs):
+        calls.append(list(argv))
+        if len(calls) == 1:
+            return create_process
+        raise OSError("sbx rm also unavailable")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
+
+    with pytest.raises(SandboxUnavailableError) as exc_info:
+        await factory.create()
+
+    assert "broken pipe" in str(exc_info.value)
+    assert list(tmp_path.iterdir()) == []
+
+
 # --- upload_bytes / read_file (direct workspace I/O, no subprocess) ----------
 
 
@@ -204,6 +295,49 @@ async def test_workspace_root_itself_is_a_valid_target(sandbox: SbxSandbox, work
     # Exercises the boundary case: the resolved path equals the workspace root exactly.
     result = sandbox._resolve_workspace_path(".")
     assert result == workspace.resolve()
+
+
+# --- extract_archive (direct workspace I/O, no subprocess/shell tar) --------
+
+
+async def test_extract_archive_strips_the_top_level_directory(
+    sandbox: SbxSandbox, workspace: Path
+) -> None:
+    archive = _make_tarball({"README.md": b"# hi", "app/main.py": b"print('hi')"})
+    await sandbox.upload_bytes("archive.tar.gz", archive)
+
+    result = await sandbox.extract_archive("archive.tar.gz", "repo")
+
+    assert result.exit_code == 0
+    extracted = workspace / "repo"
+    assert (extracted / "README.md").read_text() == "# hi"
+    assert (extracted / "app" / "main.py").read_text() == "print('hi')"
+    assert not (extracted / "acme-api-3f2c9ab").exists()
+
+
+async def test_extract_archive_reports_a_missing_archive(sandbox: SbxSandbox) -> None:
+    result = await sandbox.extract_archive("archive.tar.gz", "repo")
+
+    assert result.exit_code != 0
+
+
+async def test_extract_archive_never_shells_out(
+    monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox
+) -> None:
+    """No `sh -c "tar -xzf ..."` — extraction runs entirely on the host side
+    of the workspace mount, the same way upload_bytes/read_file already do,
+    rather than through the container's own `tar`."""
+    archive = _make_tarball({"README.md": b"# hi"})
+    await sandbox.upload_bytes("archive.tar.gz", archive)
+
+    async def fail_if_called(*a, **k):
+        raise AssertionError("extract_archive must not spawn a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+
+    result = await sandbox.extract_archive("archive.tar.gz", "repo")
+
+    assert result.exit_code == 0
 
 
 # --- exec ----------------------------------------------------------------

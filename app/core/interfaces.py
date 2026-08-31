@@ -58,6 +58,18 @@ class ISandbox(Protocol):
         """Run a command inside the sandbox and capture its output."""
         ...
 
+    async def extract_archive(self, archive_path: str, dest_dir: str) -> SandboxExecResult:
+        """Extract a `.tar.gz` already uploaded at `archive_path` into `dest_dir`.
+
+        Both paths are relative to the workspace root, same convention as
+        `upload_bytes`/`read_file`. Implementations must apply a safe-extraction
+        policy equivalent to `tarfile`'s `filter="data"` (PEP 706 — rejects
+        `..`-escaping members, absolute paths, and symlinks/device files that
+        would land outside `dest_dir`) rather than shelling out to a system
+        `tar` with no such guarantee.
+        """
+        ...
+
     async def read_file(self, path: str, *, max_bytes: int = 200_000) -> str:
         """Read a file from the sandbox, truncated to `max_bytes`."""
         ...
