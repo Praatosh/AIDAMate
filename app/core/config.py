@@ -363,6 +363,20 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _openai_api_version_requires_base_url(self) -> "Settings":
+        """`OPENAI_API_VERSION` selects the Azure client and is meaningless without
+        `OPENAI_BASE_URL` (both `OpenAIAgentRunner`/`ScheduledPromptRunner` construct
+        `AsyncAzureOpenAI(base_url=..., api_version=...)` together — see
+        `openai_api_version`'s own description). Without this check, setting only
+        `OPENAI_API_VERSION` would defer a fatal misconfiguration to the SDK's own
+        opaque error on the first review, rather than failing fast at startup the
+        way every other config precondition here does.
+        """
+        if self.openai_api_version and not self.openai_base_url:
+            raise ValueError("OPENAI_API_VERSION requires OPENAI_BASE_URL to also be set")
+        return self
+
+    @model_validator(mode="after")
     def _validate_risk_thresholds(self) -> "Settings":
         """Thresholds must be ordered, or the LOW/MEDIUM/HIGH buckets are ill-defined."""
         if self.risk_medium_max_score <= self.risk_low_max_score:

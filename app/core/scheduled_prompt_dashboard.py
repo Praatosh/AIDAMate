@@ -5,7 +5,7 @@ markdown tables natively, so this is the closest thing to a "visual" view of
 every schedule that a plain Linear issue description can offer.
 """
 
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.models.scheduled_prompt import ScheduledPrompt
 
@@ -32,7 +32,15 @@ def _render_schedule(scheduled: ScheduledPrompt) -> str:
     if scheduled.frequency == "hourly":
         return f"every {scheduled.interval_hours}h"
     if scheduled.frequency == "weekly":
-        day = _WEEKDAY_NAMES[scheduled.day_of_week] if scheduled.day_of_week is not None else "?"
+        # `day_of_week` is bounds-checked (0-6) at creation only when
+        # frequency == "weekly" (`_validate_frequency_fields` in
+        # app/api/scheduled_prompts.py) — PATCH deliberately does not
+        # cross-validate (CLAUDE.md §1d's documented gap), so a value left
+        # out of range by an update is reachable here. An IndexError from a
+        # single malformed row would otherwise abort the whole
+        # organization's dashboard sync, not just that row.
+        in_range = scheduled.day_of_week is not None and 0 <= scheduled.day_of_week <= 6
+        day = _WEEKDAY_NAMES[scheduled.day_of_week] if in_range else "?"
         return f"{day} {scheduled.run_at_time} {scheduled.timezone} (weekly)"
     if scheduled.frequency == "monthly":
         day = _ordinal(scheduled.day_of_month) if scheduled.day_of_month is not None else "?"
@@ -48,13 +56,21 @@ def _render_last_run(scheduled: ScheduledPrompt) -> str:
     localized into the schedule's own `timezone` for display here — the
     same zone the 'Schedule' column already uses, so a human never has to
     mentally convert UTC to make sense of when something last ran.
-    `timezone` is already validated at creation (`_validate_timezone` in
-    `app/api/scheduled_prompts.py`), so no fallback is needed here.
+    `timezone` is validated at both creation and update (`_validate_timezone`
+    in `app/api/scheduled_prompts.py`, applied by `ScheduledPromptUpdate` too),
+    so `ZoneInfo(scheduled.timezone)` should never fail in practice — the
+    `except` below is defensive insurance against that assumption ever
+    silently stopping being true (a future write path, a hand-edited row),
+    matching the `day_of_week` guard above: one malformed schedule must never
+    abort the whole organization's dashboard sync.
     """
     if scheduled.last_run_at is None:
         return "never"
-    local = scheduled.last_run_at.astimezone(ZoneInfo(scheduled.timezone))
-    return f"{local.strftime('%Y-%m-%d %H:%M')} {scheduled.timezone}"
+    try:
+        local = scheduled.last_run_at.astimezone(ZoneInfo(scheduled.timezone))
+        return f"{local.strftime('%Y-%m-%d %H:%M')} {scheduled.timezone}"
+    except (ZoneInfoNotFoundError, ValueError):
+        return f"{scheduled.last_run_at.isoformat()} (invalid timezone {scheduled.timezone!r})"
 
 
 def _escape_cell(text: str) -> str:

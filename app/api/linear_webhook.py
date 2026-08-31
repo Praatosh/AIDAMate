@@ -357,33 +357,33 @@ async def handle_linear_webhook(request: Request, response: Response) -> Webhook
         response.status_code = status.HTTP_400_BAD_REQUEST
         return WebhookAck(accepted=False, reason="stale_delivery")
 
+    # The two separate, opt-in "issue landed on Done" paths — gated auto-merge
+    # (CLAUDE.md §1a, keyed off a ReviewJob) and closing a linked GitHub Issue
+    # back (§1c's reverse direction, keyed off a SyncMapping) — are checked
+    # unconditionally, before (and independent of) `extract_review_trigger`
+    # below. They used to run only when no review trigger was also found for
+    # this delivery, which silently broke both whenever LINEAR_AUTO_REVIEW_
+    # ENABLED was on: a Done-type state change is itself an "update" action,
+    # so `_extract_auto_trigger` would produce a review trigger for that same
+    # event and short-circuit past the done-trigger check entirely. Both may
+    # fire for the same delivery if somehow both apply, though in practice a
+    # given Linear issue is normally one or the other, never both. Awaited
+    # inline rather than queued: at most one Linear/GitHub call each, well
+    # within the 10s ack budget, and neither runs a sandboxed review.
+    done_trigger = _extract_issue_done_trigger(event)
+    if done_trigger is not None:
+        done_trigger = done_trigger.model_copy(update={"delivery_id": request.headers.get(DELIVERY_HEADER)})
+        if settings.auto_merge_on_done_enabled and request.app.state.auto_merge_service is not None:
+            await request.app.state.auto_merge_service.handle_issue_done(done_trigger)
+        if settings.github_issue_sync_enabled and request.app.state.github_issue_sync_service is not None:
+            await request.app.state.github_issue_sync_service.handle_linear_issue_done(done_trigger)
+
     trigger = extract_review_trigger(
         event,
         await _resolve_actor_id(request, event.organization_id),
         auto_review_enabled=settings.linear_auto_review_enabled,
     )
     if trigger is None:
-        # Not a review request — check the two separate, opt-in "issue landed
-        # on Done" paths before giving up on this delivery: gated auto-merge
-        # (CLAUDE.md §1a, keyed off a ReviewJob) and closing a linked GitHub
-        # Issue back (§1c's reverse direction, keyed off a SyncMapping) are
-        # independent features that can each be on or off; both may fire for
-        # the same delivery if somehow both apply, though in practice a given
-        # Linear issue is normally one or the other, never both. Awaited
-        # inline rather than queued: at most one Linear/GitHub call each,
-        # well within the 10s ack budget, and neither runs a sandboxed review.
-        done_trigger = _extract_issue_done_trigger(event)
-        if done_trigger is not None:
-            done_trigger = done_trigger.model_copy(
-                update={"delivery_id": request.headers.get(DELIVERY_HEADER)}
-            )
-            if settings.auto_merge_on_done_enabled and request.app.state.auto_merge_service is not None:
-                await request.app.state.auto_merge_service.handle_issue_done(done_trigger)
-            if (
-                settings.github_issue_sync_enabled
-                and request.app.state.github_issue_sync_service is not None
-            ):
-                await request.app.state.github_issue_sync_service.handle_linear_issue_done(done_trigger)
         response.status_code = status.HTTP_202_ACCEPTED
         return WebhookAck(accepted=True, reason="event_ignored")
 

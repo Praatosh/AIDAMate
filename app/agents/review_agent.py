@@ -198,8 +198,16 @@ class OpenAIAgentRunner:
         # `api_version` selects the Azure client: Azure OpenAI / Azure AI
         # Foundry endpoints reject requests missing the `api-version` query
         # parameter, which only `AsyncAzureOpenAI` adds automatically — the
-        # plain client has no equivalent option.
-        self._tracing_disabled = base_url is not None
+        # plain client has no equivalent option. `_tracing_disabled` is tied
+        # to `api_version` too, not just `base_url`: an Azure/Azure AI Foundry
+        # key generally can't authenticate against OpenAI's own tracing-upload
+        # endpoint either, so tracing must stay disabled whenever the Azure
+        # branch is taken — independent of whether `base_url is not None`
+        # alone would already imply it (Settings' own validator requires the
+        # two go together in practice, but this stays correct even for a
+        # runner constructed directly, e.g. in a test, with `api_version` set
+        # and `base_url` None).
+        self._tracing_disabled = base_url is not None or api_version is not None
         if api_version:
             client = AsyncAzureOpenAI(base_url=base_url, api_key=api_key, api_version=api_version)
             set_default_openai_client(client, use_for_tracing=False)

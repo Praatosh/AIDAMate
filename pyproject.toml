@@ -32,7 +32,15 @@ dependencies = [
 
 [project.optional-dependencies]
 # Model providers — install only the one selected via MODEL_PROVIDER.
-openai = ["openai-agents>=0.1"]
+# openai-agents floor is 0.2.7, not just "some 0.x": that's the first release
+# containing ModelSettings.verbosity (openai/openai-agents-python#1439,
+# merged 2025-08-13, first shipped in v0.2.7 on 2025-08-14 — verified against
+# the real release notes, not assumed) — review_agent.py and prompt_runner.py
+# both construct ModelSettings(verbosity=...) unconditionally when a
+# reasoning-effort model is configured, which raises TypeError on any older
+# release. A bare ">=0.1" floor would let `pip install` resolve to a version
+# that predates the field entirely.
+openai = ["openai-agents>=0.2.7"]
 anthropic = ["anthropic>=0.40"]
 
 dev = [

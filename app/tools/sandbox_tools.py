@@ -4,16 +4,19 @@ Each tool is a thin wrapper over `ISandbox`, reached through the OpenAI Agents
 SDK's `RunContextWrapper` — never through the prompt string, so the sandbox
 handle itself is not something the model can see or reason about, only use.
 
-`search_code`'s `pattern`/`path` are the one place model-supplied text reaches
-a shell command (via `ISandbox.exec`, which always runs through `sh -c`).
-Both are `shlex.quote()`'d before being embedded — defense in depth, since the
-sandbox already holds no credentials, but an unescaped pattern could still
-break out of the intended `grep` invocation within the sandbox's own
-filesystem in unintended ways.
+None of `list_files`/`read_file`/`search_code` reach a shell any more: all
+three call typed `ISandbox` methods (`find_files`/`read_file`/`grep_files`)
+that each backend implements natively against its own workspace directory.
+Earlier versions of `list_files`/`search_code` built `find`/`grep` shell
+command *strings* (`sh -c "find ... | head ..."`, with `search_code`'s
+`pattern`/`path` `shlex.quote()`'d before being embedded) and ran them via
+`ISandbox.exec()` — that indirection, and the escaping it required, is gone
+now that the arguments are passed as plain typed values instead of
+reconstructed from a string.
 
-`_scoped_path` additionally rejects any `path` that would resolve outside
-`repo_dir` (a `..`-climbing or absolute path) *before* it ever reaches a
-shell command — this is the one place both `LocalSandbox` and `SbxSandbox`
+`_scoped_path` still rejects any `path` that would resolve outside
+`repo_dir` (a `..`-climbing or absolute path) before it ever reaches a
+sandbox call — this is the one place both `LocalSandbox` and `SbxSandbox`
 share, so the check belongs here rather than duplicated per backend. Found
 by a security audit: `LocalSandbox`'s `find`/`grep` implementations run
 directly on the host filesystem and did not enforce this on their own (only
@@ -35,7 +38,6 @@ scoped correctly."
 """
 
 import posixpath
-import shlex
 from dataclasses import dataclass
 
 from agents import RunContextWrapper, function_tool
@@ -52,6 +54,7 @@ SANDBOX_REPO_DIR = "repo"
 
 #: Bounds on tool output so one call cannot exhaust the agent's context.
 _MAX_LIST_FILES = 500
+_MAX_LIST_DEPTH = 4
 _MAX_SEARCH_MATCHES = 200
 _DEFAULT_READ_BYTES = 20_000
 
@@ -82,28 +85,27 @@ class PathEscapesRepositoryError(ValueError):
 
 
 def _scoped_path(repo_dir: str, path: str) -> str:
-    """Join a tool-supplied relative path onto the repo root, shell-safe.
+    """Join a tool-supplied relative path onto the repo root.
 
-    `path` is caller-controlled (ultimately model-controlled). Two defenses
-    apply, in order: `_validated_relative_path` first rejects any path that
-    would lexically resolve outside `repo_dir` — a `..`-climbing or absolute
-    path — computed with `posixpath.normpath` against the *string*, not the
-    real filesystem, so the check is identical regardless of which sandbox
-    backend eventually runs the command. Only then does `shlex.quote()` guard
-    against the *shell* reinterpreting the value. Both matter: quoting alone
-    stops shell metacharacters but not a legitimately-quoted `../../etc`.
+    `path` is caller-controlled (ultimately model-controlled).
+    `_validated_relative_path` rejects any path that would lexically resolve
+    outside `repo_dir` — a `..`-climbing or absolute path — computed with
+    `posixpath.normpath` against the *string*, not the real filesystem, so
+    the check is identical regardless of which sandbox backend eventually
+    handles the call. No shell-quoting step: the result is passed to a typed
+    `ISandbox` method (`find_files`/`grep_files`) as a plain argument, never
+    reconstructed into a shell command string.
     """
     cleaned = _validated_relative_path(repo_dir, path)
-    return f"{shlex.quote(repo_dir)}/{shlex.quote(cleaned)}"
+    return f"{repo_dir}/{cleaned}"
 
 
 def _validated_relative_path(repo_dir: str, path: str) -> str:
     """Return `path` cleaned, after confirming it stays within `repo_dir`.
 
-    Shared by all three tools — `_scoped_path` additionally shell-quotes the
-    result for `find`/`grep`; `_read_file_impl` uses this directly since
-    `ISandbox.read_file` takes a plain path, never a shell command, and
-    shell-quoting it here would corrupt the path instead of protecting it.
+    Shared by all three tools — `_scoped_path` additionally joins it onto
+    `repo_dir` for `find_files`/`grep_files`; `_read_file_impl` uses this
+    directly since it builds that same join itself for `ISandbox.read_file`.
     """
     cleaned = path.strip() or "."
     joined = posixpath.normpath(posixpath.join(repo_dir, cleaned))
@@ -118,7 +120,7 @@ async def _list_files_impl(sandbox: ISandbox, repo_dir: str, path: str) -> str:
         target = _scoped_path(repo_dir, path)
     except PathEscapesRepositoryError:
         return f"'{path}' is outside the repository root."
-    result = await sandbox.exec(f"find {target} -maxdepth 4 -type f | head -n {_MAX_LIST_FILES}")
+    result = await sandbox.find_files(target, max_depth=_MAX_LIST_DEPTH, limit=_MAX_LIST_FILES)
 
     if result.exit_code != 0:
         return f"Could not list '{path}': {result.stderr.strip() or 'unknown error'}"
@@ -142,8 +144,7 @@ async def _search_code_impl(sandbox: ISandbox, repo_dir: str, pattern: str, path
         target = _scoped_path(repo_dir, path)
     except PathEscapesRepositoryError:
         return f"'{path}' is outside the repository root."
-    quoted_pattern = shlex.quote(pattern)
-    result = await sandbox.exec(f"grep -rn -F {quoted_pattern} {target} | head -n {_MAX_SEARCH_MATCHES}")
+    result = await sandbox.grep_files(pattern, target, limit=_MAX_SEARCH_MATCHES)
 
     # grep exits 1 for "no matches" — that is a normal, non-error result, not
     # a tool failure. Only exit codes >= 2 indicate something actually broke.

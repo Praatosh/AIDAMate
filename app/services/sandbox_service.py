@@ -24,7 +24,15 @@ There is still no `cp`-based transfer needed for this app's use case.
 archive with Python's own `tarfile` (`filter="data"`) directly against the
 mounted workspace, rather than shelling `sh -c "tar -xzf ..."` into the
 container the way the previous version of this adapter did — no shell
-`tar` invocation is on this path anymore.
+`tar` invocation is on this path anymore. `find_files`/`grep_files` are the
+same move applied to the agent's `list_files`/`search_code` tools: both used
+to be built as `sh -c "find ... | head ..."` / `sh -c "grep ... | head ..."`
+strings and run via `exec()`; now they walk/read the mounted workspace
+directory in pure Python instead, with no dependency on `find`/`grep`/`head`
+existing in the container's image at all. `exec()` itself is unchanged and
+still genuinely shells into the container — it remains a general `ISandbox`
+capability, just no longer the mechanism behind any of AIDA-MATE's own
+built-in tools.
 
 One live-verified, Windows-specific gotcha `exec()` accounts for: the
 container does NOT mount the workspace at the literal host path. On this
@@ -209,6 +217,77 @@ class SbxSandbox:
         except (tarfile.TarError, OSError) as exc:
             return SandboxExecResult(exit_code=1, stdout="", stderr=str(exc))
         return SandboxExecResult(exit_code=0, stdout="", stderr="")
+
+    async def find_files(self, path: str, *, max_depth: int, limit: int) -> SandboxExecResult:
+        """List files under `path`, depth-bounded, all host-side. See `ISandbox.find_files`.
+
+        Previously reached by `app/tools/sandbox_tools.py` shelling
+        `sh -c "find <path> -maxdepth N -type f | head -n M"` into the
+        container via `exec()`. Like `extract_archive`, this now runs
+        directly against the bind-mounted workspace directory instead — no
+        subprocess, no dependency on `find`/`head` existing in the
+        container's image at all.
+        """
+        target = self._resolve_workspace_path(path)
+        return await asyncio.to_thread(self._find_files, target, max_depth, limit)
+
+    def _find_files(self, target: Path, max_depth: int, limit: int) -> SandboxExecResult:
+        if not target.exists():
+            return SandboxExecResult(exit_code=1, stdout="", stderr=f"{target}: No such file or directory")
+
+        root_depth = len(target.parts)
+        files: list[str] = []
+        for candidate in sorted(target.rglob("*")):
+            if not candidate.is_file():
+                continue
+            if len(candidate.parts) - root_depth > max_depth:
+                continue
+            files.append(self._relative_output_path(candidate))
+            if len(files) >= limit:
+                break
+        return SandboxExecResult(exit_code=0, stdout="\n".join(files), stderr="")
+
+    async def grep_files(self, pattern: str, path: str, *, limit: int) -> SandboxExecResult:
+        """Literal content search under `path`, all host-side. See `ISandbox.grep_files`.
+
+        Previously reached via `sh -c "grep -rn -F <pattern> <path> | head -n M"`
+        inside the container — same rationale as `find_files` above for
+        moving it off the shell entirely.
+        """
+        target = self._resolve_workspace_path(path)
+        return await asyncio.to_thread(self._grep_files, pattern, target, limit)
+
+    def _grep_files(self, pattern: str, target: Path, limit: int) -> SandboxExecResult:
+        if not target.exists():
+            return SandboxExecResult(exit_code=2, stdout="", stderr=f"{target}: No such file or directory")
+
+        candidates = [target] if target.is_file() else [p for p in sorted(target.rglob("*")) if p.is_file()]
+        matches: list[str] = []
+        for candidate in candidates:
+            try:
+                text = candidate.read_text(errors="replace")
+            except OSError:
+                continue
+            relative = self._relative_output_path(candidate)
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if pattern in line:
+                    matches.append(f"{relative}:{lineno}:{line}")
+                    if len(matches) >= limit:
+                        return SandboxExecResult(exit_code=0, stdout="\n".join(matches), stderr="")
+
+        exit_code = 0 if matches else 1  # grep's own convention: 1 means "no matches", not a failure
+        return SandboxExecResult(exit_code=exit_code, stdout="\n".join(matches), stderr="")
+
+    def _relative_output_path(self, candidate: Path) -> str:
+        """Render a matched path relative to the workspace root, POSIX-style.
+
+        So results line up with `ChangedFile.filename`'s own shape (e.g.
+        `"repo/app/main.py"`) and never leak the host's directory layout
+        (temp dir name, local username, ...) into agent context or,
+        ultimately, a published review comment. Mirrors
+        `LocalSandbox._relative_output_path` exactly.
+        """
+        return candidate.relative_to(self._workspace.resolve()).as_posix()
 
     async def destroy(self) -> None:
         """Remove the sandbox and its host-side workspace directory.

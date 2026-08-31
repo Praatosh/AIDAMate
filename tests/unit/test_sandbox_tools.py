@@ -1,4 +1,4 @@
-"""Agent tools over a sandbox: command scoping, escaping, and grep semantics.
+"""Agent tools over a sandbox: path scoping and typed find/grep semantics.
 
 Tests exercise `_list_files_impl`/`_read_file_impl`/`_search_code_impl`
 directly rather than going through the `@function_tool`-decorated wrappers'
@@ -7,9 +7,14 @@ machinery (tool_name, tool_call_id, run tracing state) that isn't worth
 depending on to test "does this command get built and scoped correctly."
 `list_files`/`read_file`/`search_code` themselves are one-line delegations to
 these impls, covered implicitly.
+
+None of these tools reach a shell any more — `find_files`/`grep_files` are
+typed `ISandbox` methods taking plain arguments (a path, a pattern, a
+depth/limit), not commands assembled into a string. `FakeSandbox` mirrors
+that: it records calls to those methods directly rather than a command string
+a shell would have parsed.
 """
 
-import shlex
 from dataclasses import dataclass
 
 import pytest
@@ -33,27 +38,34 @@ class _ExecResult:
 
 
 class FakeSandbox:
-    """Records exec()/read_file() calls and returns scripted results."""
+    """Records find_files()/grep_files()/read_file() calls and returns scripted results."""
 
     id = "fake-sandbox"
 
     def __init__(self) -> None:
-        self.exec_calls: list[str] = []
-        self.exec_kwargs: list[dict] = []
+        self.find_calls: list[dict] = []
+        self.grep_calls: list[dict] = []
         self.read_calls: list[str] = []
-        self._exec_result = _ExecResult(0)
+        self._find_result = _ExecResult(0)
+        self._grep_result = _ExecResult(0)
         self._read_result = ""
 
-    def script_exec(self, exit_code: int, stdout: str = "", stderr: str = "") -> None:
-        self._exec_result = _ExecResult(exit_code, stdout, stderr)
+    def script_find(self, exit_code: int, stdout: str = "", stderr: str = "") -> None:
+        self._find_result = _ExecResult(exit_code, stdout, stderr)
+
+    def script_grep(self, exit_code: int, stdout: str = "", stderr: str = "") -> None:
+        self._grep_result = _ExecResult(exit_code, stdout, stderr)
 
     def script_read(self, content: str) -> None:
         self._read_result = content
 
-    async def exec(self, command: str, *, cwd=None, timeout_s=None):
-        self.exec_calls.append(command)
-        self.exec_kwargs.append({"cwd": cwd, "timeout_s": timeout_s})
-        return self._exec_result
+    async def find_files(self, path: str, *, max_depth: int, limit: int):
+        self.find_calls.append({"path": path, "max_depth": max_depth, "limit": limit})
+        return self._find_result
+
+    async def grep_files(self, pattern: str, path: str, *, limit: int):
+        self.grep_calls.append({"pattern": pattern, "path": path, "limit": limit})
+        return self._grep_result
 
     async def read_file(self, path: str, *, max_bytes: int = 200_000) -> str:
         self.read_calls.append(path)
@@ -77,9 +89,11 @@ def test_scoped_path_defaults_blank_to_dot() -> None:
     assert _scoped_path("repo", "  ") == "repo/."
 
 
-def test_scoped_path_quotes_shell_metacharacters() -> None:
-    result = _scoped_path("repo", "$(whoami)")
-    assert "$(whoami)" not in result.replace("'$(whoami)'", "")  # must be inside quotes
+def test_scoped_path_does_not_alter_shell_metacharacters() -> None:
+    """No quoting step any more — `find_files`/`grep_files` take this as a
+    plain typed argument, never a shell command string, so there is nothing
+    to escape and nothing that would corrupt a legitimately unusual path."""
+    assert _scoped_path("repo", "$(whoami)") == "repo/$(whoami)"
 
 
 @pytest.mark.parametrize(
@@ -128,20 +142,19 @@ def test_validated_relative_path_rejects_escapes() -> None:
 # --- list_files ---------------------------------------------------------------
 
 
-async def test_list_files_scopes_the_command_to_the_repo_dir() -> None:
+async def test_list_files_scopes_the_call_to_the_repo_dir() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "repo/a.py\nrepo/b.py\n")
+    sandbox.script_find(0, "repo/a.py\nrepo/b.py\n")
 
     result = await _list_files_impl(sandbox, SANDBOX_REPO_DIR, ".")
 
-    assert "repo" in sandbox.exec_calls[0]
-    assert "find" in sandbox.exec_calls[0]
+    assert sandbox.find_calls[0]["path"] == "repo/."
     assert result == "repo/a.py\nrepo/b.py"
 
 
 async def test_list_files_reports_the_error_on_failure() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(1, "", "no such directory")
+    sandbox.script_find(1, "", "no such directory")
 
     result = await _list_files_impl(sandbox, SANDBOX_REPO_DIR, "nope")
 
@@ -150,20 +163,21 @@ async def test_list_files_reports_the_error_on_failure() -> None:
 
 async def test_list_files_reports_empty_result_clearly() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "")
+    sandbox.script_find(0, "")
 
     result = await _list_files_impl(sandbox, SANDBOX_REPO_DIR, "empty")
 
     assert "No files found" in result
 
 
-async def test_list_files_bounds_output_with_head() -> None:
+async def test_list_files_passes_the_depth_and_count_bounds_through() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "")
+    sandbox.script_find(0, "")
 
     await _list_files_impl(sandbox, SANDBOX_REPO_DIR, ".")
 
-    assert "head -n" in sandbox.exec_calls[0]
+    assert sandbox.find_calls[0]["max_depth"] == 4
+    assert sandbox.find_calls[0]["limit"] == 500
 
 
 # --- read_file ------------------------------------------------------------
@@ -222,41 +236,35 @@ async def test_read_file_passes_max_bytes_through() -> None:
 # --- search_code ------------------------------------------------------------
 
 
-async def test_search_code_shell_escapes_a_pattern_with_quotes_and_a_semicolon() -> None:
-    """The one LLM-controlled input that reaches a shell string — must not break out.
-
-    Verified by round-tripping the built command through `shlex.split` (the
-    same tokenization a POSIX `sh -c` would perform): if the escaping is
-    correct, the malicious payload survives as exactly one token, rather than
-    splitting into a second shell command at the `;`.
-    """
+async def test_search_code_passes_an_unusual_pattern_through_verbatim() -> None:
+    """A pattern with quotes/semicolons/etc. used to be the one LLM-controlled
+    input reaching a shell string, and had to be `shlex.quote()`'d to avoid
+    breaking out. `grep_files` takes `pattern` as a plain typed argument now
+    — there is no shell to break out of, so it should reach the sandbox call
+    completely unchanged, not re-encoded or escaped."""
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "")
+    sandbox.script_grep(0, "")
 
-    malicious_pattern = "x'; rm -rf / #"
-    await _search_code_impl(sandbox, SANDBOX_REPO_DIR, malicious_pattern, ".")
+    unusual_pattern = "x'; rm -rf / #"
+    await _search_code_impl(sandbox, SANDBOX_REPO_DIR, unusual_pattern, ".")
 
-    tokens = shlex.split(sandbox.exec_calls[0])
-    assert malicious_pattern in tokens
-    assert "grep" in tokens
-    # If injection had succeeded, "rm" would appear as its own command token
-    # (e.g. after a `;`), not embedded inside the single pattern token.
-    assert tokens.count("rm") == 0
+    assert sandbox.grep_calls[0]["pattern"] == unusual_pattern
 
 
-async def test_search_code_uses_fixed_string_grep() -> None:
+async def test_search_code_scopes_the_call_to_the_repo_dir() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "repo/a.py:3:token")
+    sandbox.script_grep(0, "repo/a.py:3:token")
 
     await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "token", ".")
 
-    assert "grep -rn -F" in sandbox.exec_calls[0]
+    assert sandbox.grep_calls[0]["path"] == "repo/."
+    assert sandbox.grep_calls[0]["limit"] == 200
 
 
 async def test_search_code_treats_exit_code_1_as_no_matches_not_an_error() -> None:
     """grep returns 1 for 'nothing found' — that's a normal result, not a tool failure."""
     sandbox = FakeSandbox()
-    sandbox.script_exec(1, "")
+    sandbox.script_grep(1, "")
 
     result = await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "nonexistent_xyz", ".")
 
@@ -265,7 +273,7 @@ async def test_search_code_treats_exit_code_1_as_no_matches_not_an_error() -> No
 
 async def test_search_code_treats_exit_code_2_as_a_real_failure() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(2, "", "grep: invalid option")
+    sandbox.script_grep(2, "", "grep: invalid option")
 
     result = await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "x", ".")
 
@@ -274,33 +282,27 @@ async def test_search_code_treats_exit_code_2_as_a_real_failure() -> None:
 
 async def test_search_code_returns_matches() -> None:
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "repo/auth.py:10:password == input_password")
+    sandbox.script_grep(0, "repo/auth.py:10:password == input_password")
 
     result = await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "password ==", ".")
 
     assert "repo/auth.py:10" in result
 
 
-@pytest.mark.parametrize("shell_metachar_path", ["$(whoami)", "`id`", "a; rm -rf /"])
-async def test_search_code_path_with_shell_metacharacters_is_escaped(shell_metachar_path: str) -> None:
-    """A path containing shell-special characters must not enable injection.
-
-    These particular strings don't climb outside the repo root lexically (no
-    `..`), so they pass the traversal check and reach `shlex.quote`, which is
-    what this test is actually about — injection via shell metacharacters is
-    a separate concern from path traversal (see the traversal-rejection tests
-    above and `test_search_code_traversal_path_is_rejected` below).
-    """
+@pytest.mark.parametrize("unusual_path", ["$(whoami)", "`id`", "a; rm -rf /"])
+async def test_search_code_path_with_shell_metacharacters_passes_through_unchanged(
+    unusual_path: str,
+) -> None:
+    """These particular strings don't climb outside the repo root lexically
+    (no `..`), so they pass the traversal check and reach `grep_files` as a
+    plain argument — with no shell downstream, there's nothing to escape and
+    nothing that could reinterpret them as a second command."""
     sandbox = FakeSandbox()
-    sandbox.script_exec(0, "")
+    sandbox.script_grep(0, "")
 
-    await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "x", shell_metachar_path)
+    await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "x", unusual_path)
 
-    tokens = shlex.split(sandbox.exec_calls[0])
-    assert any(shell_metachar_path in token for token in tokens)
-    assert "rm" not in tokens
-    assert "whoami" not in tokens
-    assert "id" not in tokens
+    assert sandbox.grep_calls[0]["path"] == f"repo/{unusual_path}"
 
 
 async def test_search_code_traversal_path_is_rejected() -> None:
@@ -314,7 +316,7 @@ async def test_search_code_traversal_path_is_rejected() -> None:
 
     result = await _search_code_impl(sandbox, SANDBOX_REPO_DIR, "x", "../../etc/passwd")
 
-    assert sandbox.exec_calls == []
+    assert sandbox.grep_calls == []
     assert "outside the repository root" in result
 
 

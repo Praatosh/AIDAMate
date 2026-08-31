@@ -340,6 +340,91 @@ async def test_extract_archive_never_shells_out(
     assert result.exit_code == 0
 
 
+# --- find_files / grep_files (direct workspace I/O, no subprocess/shell) ----
+
+
+async def test_find_files_lists_files_under_the_target(sandbox: SbxSandbox) -> None:
+    await sandbox.upload_bytes("repo/app/main.py", b"...")
+    await sandbox.upload_bytes("repo/README.md", b"...")
+
+    result = await sandbox.find_files("repo", max_depth=4, limit=500)
+
+    assert result.exit_code == 0
+    assert set(result.stdout.splitlines()) == {"repo/app/main.py", "repo/README.md"}
+
+
+async def test_find_files_respects_max_depth(sandbox: SbxSandbox) -> None:
+    await sandbox.upload_bytes("repo/a.py", b"...")
+    await sandbox.upload_bytes("repo/deep/deeper/deepest/way/too/far.py", b"...")
+
+    result = await sandbox.find_files("repo", max_depth=1, limit=500)
+
+    assert result.stdout == "repo/a.py"
+
+
+async def test_find_files_on_missing_target_fails(sandbox: SbxSandbox) -> None:
+    result = await sandbox.find_files("repo/nowhere", max_depth=4, limit=500)
+
+    assert result.exit_code == 1
+
+
+async def test_find_files_rejects_a_workspace_escape(sandbox: SbxSandbox) -> None:
+    with pytest.raises(ValueError, match="escapes"):
+        await sandbox.find_files("../outside", max_depth=4, limit=500)
+
+
+async def test_find_files_never_shells_out(monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox) -> None:
+    """No `sh -c "find ... | head ..."` — this runs entirely on the host
+    side of the workspace mount, like upload_bytes/read_file/extract_archive."""
+    await sandbox.upload_bytes("repo/main.py", b"...")
+
+    async def fail_if_called(*a, **k):
+        raise AssertionError("find_files must not spawn a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+
+    result = await sandbox.find_files("repo", max_depth=4, limit=500)
+
+    assert result.exit_code == 0
+
+
+async def test_grep_files_finds_a_literal_match(sandbox: SbxSandbox) -> None:
+    await sandbox.upload_bytes("repo/auth.py", b"def check():\n    return validate_token(t)\n")
+
+    result = await sandbox.grep_files("validate_token", "repo", limit=200)
+
+    assert result.exit_code == 0
+    assert "repo/auth.py:2:" in result.stdout
+    assert "validate_token" in result.stdout
+
+
+async def test_grep_files_no_matches_is_not_an_error(sandbox: SbxSandbox) -> None:
+    await sandbox.upload_bytes("repo/auth.py", b"nothing interesting here\n")
+
+    result = await sandbox.grep_files("totally_absent_symbol", "repo", limit=200)
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+
+
+async def test_grep_files_rejects_a_workspace_escape(sandbox: SbxSandbox) -> None:
+    with pytest.raises(ValueError, match="escapes"):
+        await sandbox.grep_files("x", "../outside", limit=200)
+
+
+async def test_grep_files_never_shells_out(monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox) -> None:
+    await sandbox.upload_bytes("repo/auth.py", b"token here\n")
+
+    async def fail_if_called(*a, **k):
+        raise AssertionError("grep_files must not spawn a subprocess")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail_if_called)
+
+    result = await sandbox.grep_files("token", "repo", limit=200)
+
+    assert result.exit_code == 0
+
+
 # --- exec ----------------------------------------------------------------
 
 

@@ -277,8 +277,15 @@ a clock match. All five are judged in `app/workers/scheduled_prompt_worker.py`'s
 `_is_due` from a **single** `last_run_at: datetime | None` (UTC) field —
 deliberately not one tracking field per frequency: `hourly` compares elapsed
 time against it directly, and `once`/`daily`/`weekly`/`monthly` all share one
-"clock matches, and `last_run_at` isn't already in the current period"
-shape, localized into the schedule's own timezone at check time. A fired
+"clock has reached `run_at_time`, and `last_run_at` isn't already in the
+current period" shape, localized into the schedule's own timezone at check
+time. `daily`/`weekly`/`monthly` compare with `<` rather than an exact
+`HH:MM` match (`once` still requires an exact match, since it never gets a
+second tick to catch up on once its one date has passed) — the 60-second
+tick loop can land a few seconds after the target minute, and an exact-match
+check would silently skip firing for the entire day/week/month rather than
+catching up on the next tick; `already_ran_this_period` is what actually
+prevents re-firing on every later tick once it has fired once. A fired
 `once` schedule is deleted outright in the same `tick()` pass, before
 `service.run()` is even called — not just disabled: user-requested, so a
 one-shot schedule disappears from the dashboard the moment it's done rather
@@ -1413,6 +1420,167 @@ tests — worth knowing so the same class of bug doesn't come back:
   `SANDBOX_BINARY`/`SANDBOX_MODE` reordered per the finding — purely
   cosmetic, no functional effect either order. New regression test for the
   OSError path. Full suite (1209 tests) green, `ruff check` clean.
+- **Archive extraction moved off shell `tar`; a second `SbxSandboxFactory.
+  create()` cleanup gap fixed; the scheduled-prompt due-check's exact-minute
+  match relaxed.** Three more verified findings from a further review round.
+  (1) Both `app/agents/orchestrator.py` and `app/services/
+  scheduled_prompt_service.py` built a `"mkdir -p repo && tar -xzf
+  archive.tar.gz -C repo --strip-components=1"` string and ran it via
+  `sandbox.exec()` — the container's own `tar` has no path-traversal
+  protection the way Python's `tarfile(filter="data")` does (PEP 706).
+  GitHub-generated archives can't actually carry a `..`-escaping member
+  (git itself rejects those in tree entries), so this was never live-
+  exploitable, but `LocalSandboxService` already extracted safely via
+  `tarfile` — `SbxSandbox` was the one backend still shelling out. Fixed by
+  adding `extract_archive(archive_path, dest_dir)` to `ISandbox` itself:
+  `SbxSandbox` now extracts directly against its bind-mounted workspace
+  (same host-side pattern `upload_bytes`/`read_file` already use, no
+  subprocess at all) with `tarfile(filter="data")`; `LocalSandbox`'s
+  existing tarfile logic is exposed as this same first-class method instead
+  of being reached via `exec()` command-sniffing. Both call sites now call
+  `sandbox.extract_archive(...)` directly rather than building a shell
+  string. (2) `SbxSandboxFactory.create()`'s OSError handling (the entry
+  above) only covered `create_subprocess_exec` itself failing to launch. If
+  `process.communicate()` raised OSError *after* a successful launch, `sbx
+  create` may already have provisioned a real sandbox on the daemon side —
+  a bare workspace cleanup would leak it. Fixed by splitting the two cases:
+  a launch failure behaves as before (nothing to clean up beyond the
+  workspace), while a `communicate()` failure now kills/reaps the local
+  process and best-effort issues `sbx rm NAME --force` before removing the
+  workspace, mirroring `destroy()`'s own best-effort cleanup — the `sbx rm`
+  attempt is itself wrapped so its own failure can't mask the original
+  error. (3) Separately (not from a review finding — surfaced by re-reading
+  `app/workers/scheduled_prompt_worker.py`'s `_is_due`): the `daily`/
+  `weekly`/`monthly` due-check compared `now.strftime("%H:%M") !=
+  scheduled.run_at_time` — an *exact* minute match. `DEFAULT_TICK_INTERVAL_S`
+  is 60s, so a tick landing even a few seconds late (GC pause, a slow
+  `list_all()`, ordinary jitter) would miss the exact minute and skip
+  firing for the entire day/week/month, not just that tick — the "check
+  every 60s" comment in the same file already assumed minute-granularity
+  couldn't be missed, which isn't true for an exact-equality check.
+  Changed to `<` (not-yet-due only strictly *before* `run_at_time`); a tick
+  landing after the target minute now still fires. `already_ran_this_period`
+  (unchanged) is what actually prevents re-firing on every later tick within
+  the same period, so relaxing the clock check to `<` doesn't introduce
+  duplicate fires. `once` is intentionally unaffected — it still requires an
+  exact match, since a `once` schedule that missed its date has no "later
+  tick within the same period" to catch up on; §1d's own text now reflects
+  this. New/updated regression tests across `test_sandbox_service.py`,
+  `test_local_sandbox_service.py`, `test_orchestrator.py`,
+  `test_scheduled_prompt_service.py`, and `test_scheduled_prompt_worker.py`.
+  Full suite green, `ruff check` clean.
+- **`list_files`/`search_code` moved off shell `find`/`grep` too; a real
+  Linear-webhook trigger-ordering bug; a config-level Azure precondition; a
+  malformed-row/malformed-schedule crash guard.** A further review round, 5
+  of 7 findings fixed, 2 skipped with reasons recorded here. (1) `ISandbox`
+  gains `find_files(path, *, max_depth, limit)` /
+  `grep_files(pattern, path, *, limit)`, joining `extract_archive` as typed
+  operations neither backend reaches through a shell: `SbxSandbox` walks/reads
+  its bind-mounted workspace directly in Python (no subprocess at all,
+  confirmed by a regression test that fails if `create_subprocess_exec` is
+  ever called); `LocalSandbox`'s existing `_find_files`/`_grep` are exposed as
+  these same first-class methods instead of being reached via `exec()`
+  regex-matching a command string `app/tools/sandbox_tools.py` used to build
+  (`sh -c "find ... | head ..."` / `sh -c "grep ... -F ... | head ..."`,
+  `search_code`'s pattern `shlex.quote()`'d before embedding). `exec()` itself
+  is unchanged and still genuinely shells into the container on `SbxSandbox`
+  — it just isn't how any of AIDA-MATE's own tools work any more; on
+  `LocalSandbox`, `exec()` now always returns "unsupported" since nothing
+  calls it. A real, if minor, bug fixed as an incidental part of this same
+  rewrite (not the finding's own ask, discovered while touching this code):
+  `LocalSandbox.find_files`/`grep_files` used to return **absolute host
+  filesystem paths** (e.g. `C:\Users\...\aida-mate-local-xyz\repo\app\main.py`)
+  in their output — inherited from the old `exec()`/regex-command era, where
+  `cwd` was always resolved to an absolute host path first. Live-tested and
+  confirmed: this could leak local machine layout (temp dir naming, the
+  Windows username) into agent context and, since a `Finding.location` can
+  echo a tool result, potentially into a published review comment. Now
+  relative to the workspace root (e.g. `"repo/app/main.py"`), matching
+  `ChangedFile.filename`'s own shape, for both backends — `SbxSandbox`'s new
+  methods were never affected (nothing used it there before), only
+  `LocalSandbox`'s pre-existing behavior changed. (2) `app/api/
+  linear_webhook.py`'s `handle_linear_webhook` only checked
+  `_extract_issue_done_trigger` (§1a's gated auto-merge, §1c's reverse
+  close-sync) when `extract_review_trigger` returned `None` — but a Done-type
+  state change is itself an "update" action, so with
+  `LINEAR_AUTO_REVIEW_ENABLED=true`, `_extract_auto_trigger` would produce a
+  review trigger for that *same* event and silently short-circuit past the
+  done-trigger check, breaking `AUTO_MERGE_ON_DONE_ENABLED`/
+  `GITHUB_ISSUE_SYNC_ENABLED`'s reverse direction for as long as auto-review
+  stayed on. Fixed by checking `_extract_issue_done_trigger` unconditionally,
+  before (not nested inside a branch of) `extract_review_trigger` — both may
+  now genuinely fire for the same delivery, matching the handler's own
+  pre-existing comment that this was already anticipated as possible. Not
+  reachable in this deployment's `.env` (`LINEAR_AUTO_REVIEW_ENABLED` unset),
+  but a real, silent break waiting for whoever flips it on next to
+  `AUTO_MERGE_ON_DONE_ENABLED=true` (already `true` here). (3) `Settings`
+  gains a `model_validator` requiring `OPENAI_BASE_URL` whenever
+  `OPENAI_API_VERSION` is set — both `OpenAIAgentRunner`/
+  `ScheduledPromptRunner` construct `AsyncAzureOpenAI(base_url=..., api_version=...)`
+  together, so a config with only `OPENAI_API_VERSION` set would previously
+  defer a fatal misconfiguration to the SDK's own opaque error on the first
+  review rather than failing fast at startup, matching every other config
+  precondition in this file. `_tracing_disabled` in both runners is now
+  `base_url is not None or api_version is not None` (was only the former) —
+  redundant with the new validator in practice, but keeps a runner
+  constructed directly (e.g. in a test) with `api_version` set and `base_url`
+  `None` correct too, since an Azure/Azure AI Foundry key generally can't
+  authenticate against OpenAI's own tracing-upload endpoint any more than a
+  gateway key can. (4) `SqliteScheduledPromptRepository.list_all()` raised on
+  the first row that failed `ScheduledPrompt.model_validate_json` — this is
+  the batch load `ScheduledPromptWorker.tick()` calls first on every tick, so
+  one malformed row (a hand-edited SQLite file, a row written by a
+  since-changed schema) would have poisoned every other schedule's due-check
+  forever, the same class of "one bad record blocks everything" bug §8
+  already fixed once for the worker's own per-entry due-check. Now logs and
+  skips a row that fails to deserialize instead of raising, returning every
+  schedule that *did* parse. (5) `ScheduledPromptDashboardService`'s render
+  path (`app/core/scheduled_prompt_dashboard.py`) could crash the whole
+  organization's dashboard sync on one malformed row: `day_of_week` has no
+  field-level bounds and is only cross-validated against `frequency ==
+  "weekly"` at creation — `ScheduledPromptUpdate`/PATCH deliberately doesn't
+  cross-validate at all (an already-documented, accepted gap) — so a PATCH
+  could leave an out-of-range `day_of_week` on a weekly schedule, crashing
+  `_WEEKDAY_NAMES[scheduled.day_of_week]` with `IndexError` for every team's
+  dashboard sync, not just that one row. Guarded the same way the "?" fallback
+  for a missing `day_of_week` already worked, just widened to also catch
+  out-of-range. `_render_last_run`'s `ZoneInfo(scheduled.timezone)` construction
+  got the equivalent defensive `except` even though `timezone` genuinely is
+  validated on both create *and* update today (confirmed by reading
+  `ScheduledPromptUpdate`'s own field validators) — kept as insurance against
+  that assumption ever silently stopping being true, not because a live gap
+  was found. **Skipped:** (a) "Pass the SDK's typed `Reasoning` object instead
+  of a dict to `ModelSettings(reasoning=...)`" — verified live in this
+  session's own interpreter: `ModelSettings(reasoning={"effort": "low"})`
+  already produces a correctly-populated `Reasoning` instance (pydantic's
+  automatic dict-to-dataclass coercion), and a plain dict is the SDK's own
+  documented usage example — not a bug, so not changed. The finding's other
+  half *was* valid though: `pyproject.toml`'s `openai-agents>=0.1` floor was
+  far looser than what the code actually needs — `ModelSettings.verbosity`
+  didn't exist before v0.2.7 (openai/openai-agents-python#1439, merged
+  2025-08-13, first released in v0.2.7 the next day — verified against the
+  real GitHub release notes, not assumed), so a fresh install could resolve
+  to a version where both runners' unconditional `ModelSettings(verbosity=...)`
+  raises `TypeError`. Bumped to `>=0.2.7` and documented why. (b)
+  "`AttachmentStrategy.resolve()` should filter matches through
+  `GITHUB_REPO_ALLOWLIST`" — `app/core/config.py`'s own `github_repo_allowlist`
+  description explicitly scopes that setting to "searched when a Linear issue
+  has no attached PR and AIDA-MATE must fall back to branch-name or title
+  matching" — attachment resolution doesn't search GitHub at all, and the
+  module docstring already treats a genuine Linear-attached PR link as the
+  *highest*-confidence signal ("a real link, not an inference"). Unlike the
+  scheduled-prompts allowlist gap fixed earlier (reachable by anyone who could
+  reach the host, no auth at all), reaching `AttachmentStrategy` requires
+  already being able to delegate a Linear issue in a connected, OAuth-
+  authorized workspace — a materially different trust boundary, and one this
+  codebase has no prior documented decision about either way. Flagging back
+  rather than silently expanding a security-relevant scope boundary the
+  config's own docstring narrowly and deliberately defines elsewhere — matches
+  §2's "flag back, don't silently implement" precedent for risk/label-scope
+  changes, applied here by analogy. New/updated regression tests across
+  `test_sandbox_service.py`, `test_local_sandbox_service.py`,
+  `test_sandbox_tools.py`, `test_sqlite_scheduled_prompt_repository.py`.
+  Full suite (1226 tests) green, `ruff check` clean.
 
 ## 9. Standing working agreements with this user
 

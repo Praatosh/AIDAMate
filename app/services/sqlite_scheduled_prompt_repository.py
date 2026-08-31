@@ -13,7 +13,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from pydantic import ValidationError
+
+from app.core.logging import get_logger
 from app.models.scheduled_prompt import ScheduledPrompt
+
+logger = get_logger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scheduled_prompts (
@@ -87,10 +92,29 @@ class SqliteScheduledPromptRepository:
     async def list_all(self) -> list[ScheduledPrompt]:
         def _query() -> list[sqlite3.Row]:
             with self._connect() as conn:
-                return conn.execute("SELECT payload FROM scheduled_prompts").fetchall()
+                return conn.execute("SELECT id, payload FROM scheduled_prompts").fetchall()
 
         rows = await asyncio.to_thread(_query)
-        return [ScheduledPrompt.model_validate_json(row["payload"]) for row in rows]
+
+        schedules: list[ScheduledPrompt] = []
+        for row in rows:
+            try:
+                schedules.append(ScheduledPrompt.model_validate_json(row["payload"]))
+            except ValidationError:
+                # One malformed row must not poison every tick forever: this
+                # is the batch load `ScheduledPromptWorker.tick()` calls first
+                # on every tick, so an unhandled exception here would have
+                # stopped every *other* schedule from ever firing again until
+                # a human found and fixed/deleted the bad row by hand — the
+                # same class of "one bad record blocks everything" bug already
+                # fixed for the worker's own per-entry due-check (CLAUDE.md
+                # §8). Logged and skipped instead; the row is left in place so
+                # it can still be inspected/fixed rather than silently lost.
+                logger.warning(
+                    "Skipping a scheduled prompt row that failed to deserialize",
+                    extra={"scheduled_prompt_id": row["id"]},
+                )
+        return schedules
 
     async def delete(self, scheduled_id: str) -> None:
         def _delete() -> None:

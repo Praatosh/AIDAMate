@@ -5,6 +5,7 @@ Runs against a real SQLite file in `tmp_path`, same reasoning as
 surviving a new instance) only exists in the database itself.
 """
 
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -56,6 +57,29 @@ async def test_list_all_returns_every_schedule(repo: SqliteScheduledPromptReposi
 
     titles = {scheduled.title for scheduled in await repo.list_all()}
     assert titles == {"First", "Second"}
+
+
+async def test_list_all_skips_a_malformed_row_instead_of_raising(
+    repo: SqliteScheduledPromptRepository, db_path: Path
+) -> None:
+    """A row that fails to deserialize (e.g. hand-edited, or written by a
+    since-changed schema) must not poison the whole batch load — this is
+    what `ScheduledPromptWorker.tick()` calls first on every tick, so an
+    unhandled exception here would silently stop every *other* schedule from
+    ever firing again."""
+    valid = await repo.create(_scheduled("Valid one"))
+
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO scheduled_prompts (id, created_at, payload) VALUES (?, ?, ?)",
+        ("broken-row", datetime.now(UTC).isoformat(), "not valid json"),
+    )
+    conn.commit()
+    conn.close()
+
+    schedules = await repo.list_all()
+
+    assert [s.id for s in schedules] == [valid.id]
 
 
 async def test_save_persists_mutations(repo: SqliteScheduledPromptRepository) -> None:

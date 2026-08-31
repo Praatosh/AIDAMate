@@ -70,6 +70,29 @@ class ISandbox(Protocol):
         """
         ...
 
+    async def find_files(self, path: str, *, max_depth: int, limit: int) -> SandboxExecResult:
+        """List files under `path` (relative to the workspace root), depth-bounded.
+
+        `stdout` is at most `limit` newline-separated paths, each *relative to
+        the workspace root* (e.g. `"repo/app/main.py"`, matching
+        `ChangedFile.filename`'s own shape) — never an absolute host
+        filesystem path, which would both fail to line up with anything the
+        agent can compare it to and leak local machine layout into agent
+        context and, ultimately, a published review comment.
+        """
+        ...
+
+    async def grep_files(self, pattern: str, path: str, *, limit: int) -> SandboxExecResult:
+        """Search for the literal string `pattern` (not a regex) under `path`.
+
+        `stdout` is at most `limit` newline-separated `"path:lineno:line"`
+        entries, `path` relative to the workspace root — same convention as
+        `find_files`. `exit_code` follows `grep`'s own convention: `1` means
+        "ran fine, no matches" (not a tool failure); `>= 2` means something
+        actually broke.
+        """
+        ...
+
     async def read_file(self, path: str, *, max_bytes: int = 200_000) -> str:
         """Read a file from the sandbox, truncated to `max_bytes`."""
         ...

@@ -109,106 +109,117 @@ async def test_extract_archive_reports_a_missing_archive(sandbox: LocalSandbox) 
     assert result.exit_code != 0
 
 
-# --- exec(): find/list_files -----------------------------------------------------
+# --- find_files(): list_files ------------------------------------------------
 
 
-async def test_exec_find_lists_files_under_the_target(sandbox: LocalSandbox) -> None:
+async def test_find_files_lists_files_under_the_target(sandbox: LocalSandbox) -> None:
     await sandbox.upload_bytes("repo/app/main.py", b"...")
     await sandbox.upload_bytes("repo/app/util.py", b"...")
     await sandbox.upload_bytes("repo/README.md", b"...")
 
-    result = await sandbox.exec("find repo -maxdepth 4 -type f | head -n 500")
+    result = await sandbox.find_files("repo", max_depth=4, limit=500)
 
     assert result.exit_code == 0
     names = {Path(line).name for line in result.stdout.splitlines()}
     assert names == {"main.py", "util.py", "README.md"}
 
 
-async def test_exec_find_respects_maxdepth(sandbox: LocalSandbox) -> None:
+async def test_find_files_returns_workspace_relative_paths(sandbox: LocalSandbox) -> None:
+    """Results must line up with `ChangedFile.filename`'s own shape and never
+    leak the host's directory layout (temp dir name, local username, ...)
+    into agent context or a published review comment."""
+    await sandbox.upload_bytes("repo/app/main.py", b"...")
+
+    result = await sandbox.find_files("repo", max_depth=4, limit=500)
+
+    assert result.stdout == "repo/app/main.py"
+
+
+async def test_find_files_respects_max_depth(sandbox: LocalSandbox) -> None:
     await sandbox.upload_bytes("repo/a.py", b"...")
     await sandbox.upload_bytes("repo/deep/deeper/deepest/way/too/far.py", b"...")
 
-    result = await sandbox.exec("find repo -maxdepth 1 -type f | head -n 500")
+    result = await sandbox.find_files("repo", max_depth=1, limit=500)
 
     names = {Path(line).name for line in result.stdout.splitlines()}
     assert names == {"a.py"}
 
 
-async def test_exec_find_on_missing_target_fails(sandbox: LocalSandbox) -> None:
-    result = await sandbox.exec("find repo/nowhere -maxdepth 4 -type f | head -n 500")
+async def test_find_files_on_missing_target_fails(sandbox: LocalSandbox) -> None:
+    result = await sandbox.find_files("repo/nowhere", max_depth=4, limit=500)
 
     assert result.exit_code == 1
 
 
-async def test_exec_find_rejects_a_workspace_escape(sandbox: LocalSandbox, workspace: Path) -> None:
-    """Security-audit finding: `find` runs directly on the host filesystem
-    for this backend (unlike `SbxSandbox`, isolated in a VM), so a
-    `..`-climbing target must be rejected the same way `upload_bytes`/
-    `read_file` already reject one via `_resolve_workspace_path` — this
-    proves `_find_files` now goes through the same check instead of
-    resolving `cwd / target` unchecked."""
+async def test_find_files_rejects_a_workspace_escape(sandbox: LocalSandbox, workspace: Path) -> None:
+    """Security-audit finding: `find_files` runs directly on the host
+    filesystem for this backend (unlike `SbxSandbox`, isolated in a VM), so
+    a `..`-climbing target must be rejected the same way `upload_bytes`/
+    `read_file` already reject one via `_resolve_workspace_path`."""
     secret = workspace.parent / "secret.txt"
     secret.write_text("host secret outside the sandbox")
 
-    result = await sandbox.exec("find ../secret.txt -maxdepth 4 -type f | head -n 500")
+    result = await sandbox.find_files("../secret.txt", max_depth=4, limit=500)
 
     assert result.exit_code == 2
     assert "escapes sandbox workspace" in result.stderr
 
 
-# --- exec(): grep/search_code ----------------------------------------------------
+# --- grep_files(): search_code ------------------------------------------------
 
 
-async def test_exec_grep_finds_a_literal_match(sandbox: LocalSandbox) -> None:
+async def test_grep_files_finds_a_literal_match(sandbox: LocalSandbox) -> None:
     await sandbox.upload_bytes("repo/auth.py", b"def check():\n    return validate_token(t)\n")
 
-    result = await sandbox.exec("grep -rn -F validate_token repo | head -n 200")
+    result = await sandbox.grep_files("validate_token", "repo", limit=200)
 
     assert result.exit_code == 0
-    assert "auth.py:2:" in result.stdout
+    assert "repo/auth.py:2:" in result.stdout
     assert "validate_token" in result.stdout
 
 
-async def test_exec_grep_no_matches_is_not_an_error(sandbox: LocalSandbox) -> None:
+async def test_grep_files_no_matches_is_not_an_error(sandbox: LocalSandbox) -> None:
     await sandbox.upload_bytes("repo/auth.py", b"nothing interesting here\n")
 
-    result = await sandbox.exec("grep -rn -F totally_absent_symbol repo | head -n 200")
+    result = await sandbox.grep_files("totally_absent_symbol", "repo", limit=200)
 
     assert result.exit_code == 1
     assert result.stdout == ""
 
 
-async def test_exec_grep_pattern_with_a_space_is_recovered_correctly(sandbox: LocalSandbox) -> None:
-    """`shlex.quote` wraps a spaced pattern in quotes; the recognizer must undo that."""
+async def test_grep_files_pattern_with_a_space_works_unchanged(sandbox: LocalSandbox) -> None:
+    """No shell-quoting round trip any more — a spaced pattern is just a
+    plain string argument now, not something that needs recovering."""
     await sandbox.upload_bytes("repo/auth.py", b"# access token leaked in logs\n")
 
-    result = await sandbox.exec("grep -rn -F 'access token' repo | head -n 200")
+    result = await sandbox.grep_files("access token", "repo", limit=200)
 
     assert result.exit_code == 0
     assert "access token" in result.stdout
 
 
-async def test_exec_grep_rejects_a_workspace_escape(sandbox: LocalSandbox, workspace: Path) -> None:
-    """Same finding as the `find` case above: before this fix, a crafted PR
-    could induce `search_code` to grep real host files — e.g. a plaintext
-    OAuth token file — and have the match published into a public PR
-    comment via a `Finding`. Proves `_grep` now rejects the escape instead
-    of silently reading outside the workspace."""
+async def test_grep_files_rejects_a_workspace_escape(sandbox: LocalSandbox, workspace: Path) -> None:
+    """Same finding as the `find_files` case above: before this fix, a
+    crafted PR could induce `search_code` to grep real host files — e.g. a
+    plaintext OAuth token file — and have the match published into a public
+    PR comment via a `Finding`."""
     secret = workspace.parent / "secret.txt"
     secret.write_text("api_token=super-secret-value")
 
-    result = await sandbox.exec("grep -rn -F api_token ../secret.txt | head -n 200")
+    result = await sandbox.grep_files("api_token", "../secret.txt", limit=200)
 
     assert result.exit_code == 2
     assert "escapes sandbox workspace" in result.stderr
     assert "super-secret-value" not in result.stdout
 
 
-# --- exec(): unsupported commands ------------------------------------------------
+# --- exec(): unsupported --------------------------------------------------------
 
 
-async def test_exec_rejects_an_unrecognized_command(sandbox: LocalSandbox) -> None:
-    result = await sandbox.exec("rm -rf /")
+async def test_exec_is_unsupported_by_this_backend(sandbox: LocalSandbox) -> None:
+    """Every operation this backend needs is a typed method now — `exec()`
+    stays implemented only because `ISandbox` still declares it."""
+    result = await sandbox.exec("anything")
 
     assert result.exit_code == 127
     assert "does not support" in result.stderr
@@ -237,8 +248,8 @@ async def test_destroy_never_raises_when_workspace_already_gone(
 #
 # The pure-unit tests for `_list_files_impl`/`_search_code_impl` (in
 # test_sandbox_tools.py) use a fake sandbox. These prove the actual
-# substitution works end-to-end: the exact command strings AIDA-MATE's tools
-# build are the ones LocalSandbox.exec() must recognize.
+# substitution works end-to-end: the arguments AIDA-MATE's tools build are
+# ones `LocalSandbox.find_files`/`grep_files` handle correctly for real.
 
 
 async def test_list_files_impl_works_against_a_real_local_sandbox(sandbox: LocalSandbox) -> None:

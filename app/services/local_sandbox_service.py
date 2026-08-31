@@ -19,27 +19,27 @@ mode wherever `sbx` will actually run — nothing downstream (tools,
 orchestrator, risk engine) needs to change, since both backends satisfy the
 same `ISandbox`/`ISandboxFactory` Protocols.
 
-`exec()` here does not run an arbitrary shell. AIDA-MATE's own code is the only
-caller — the LLM only ever supplies tool *arguments* (a path, a search
-pattern), never a raw command string — and it only ever issues one of the two
-fixed `find`/`grep` command shapes built in `app/tools/sandbox_tools.py`. Each
-is recognized and given a native Python implementation; anything else is
-rejected rather than silently mishandled. Archive extraction is a separate,
-first-class `extract_archive` method rather than a third recognized `exec()`
-shape — it never went through a shell here either, but exposing it as its own
-method (mirroring `SbxSandbox.extract_archive`) keeps both backends' "no
-shell `tar`" contract explicit at the `ISandbox` interface level rather than
-only true by accident of what each backend's `exec()` happens to recognize.
+`exec()` here does not run an arbitrary shell — in fact, as of this version it
+runs nothing at all. AIDA-MATE's own code is the only caller of any sandbox
+operation — the LLM only ever supplies tool *arguments* (a path, a search
+pattern), never a raw command string — and every operation this backend needs
+to support (`find_files`, `grep_files`, `extract_archive`, alongside
+`upload_bytes`/`read_file`) is now a first-class typed `ISandbox` method with
+its own native Python implementation, none of them going through a shell or
+external binary (`find`/`grep`/`tar`) at all. An earlier version of this
+backend recognized two fixed `find`/`grep` *command-string* shapes built by
+`app/tools/sandbox_tools.py` via regex matching inside `exec()` — that
+indirection is gone now that the tools call `find_files`/`grep_files`
+directly; `exec()` is kept only because `ISandbox` still declares it as a
+general capability (and `SbxSandbox` still has a real use for it, running
+inside its own isolated container), and always returns "unsupported" here.
 
-Known limitation: paths or search patterns containing a literal space are
-not reconstructed with full POSIX-shell fidelity by the regexes below (real
-PR file paths essentially never contain one). A command that cannot be
-recognized returns a clear `exit_code=127` rather than misbehaving silently.
+Known limitation: none specific to path/pattern spacing anymore, now that
+paths and patterns are passed as plain typed arguments rather than
+reconstructed from a shell command string.
 """
 
 import asyncio
-import re
-import shlex
 import shutil
 import tarfile
 import tempfile
@@ -55,22 +55,6 @@ logger = get_logger(__name__)
 #: same fixed, non-configurable filename the downloaded archive is written
 #: to inside the sandbox workspace.
 _ARCHIVE_FILENAME = "archive.tar.gz"
-
-_FIND_RE = re.compile(r"^find (?P<target>.+?) -maxdepth (?P<depth>\d+) -type f \| head -n (?P<limit>\d+)$")
-_GREP_RE = re.compile(r"^grep -rn -F (?P<rest>.+) \| head -n (?P<limit>\d+)$")
-
-
-def _split_shell_words(text: str) -> list[str] | None:
-    """Tokenize a fragment of the shell command AIDA-MATE itself built.
-
-    Returns None instead of raising on malformed input — an unrecognized
-    shape should fall through to the "unsupported command" response, not
-    crash the review.
-    """
-    try:
-        return shlex.split(text)
-    except ValueError:
-        return None
 
 
 class LocalSandbox:
@@ -97,22 +81,21 @@ class LocalSandbox:
     async def exec(
         self, command: str, *, cwd: str | None = None, timeout_s: float | None = None
     ) -> SandboxExecResult:
-        """Recognize and natively execute one of AIDA-MATE's own fixed command shapes."""
-        effective_cwd = Path(cwd) if cwd is not None else self._workspace.resolve()
+        """Not supported by this backend — see the module docstring.
 
-        if match := _FIND_RE.match(command):
-            return await asyncio.to_thread(self._find_files, effective_cwd, match)
-        if match := _GREP_RE.match(command):
-            return await asyncio.to_thread(self._grep, effective_cwd, match)
-
+        Every operation this backend needs is a typed `ISandbox` method
+        instead; nothing in the codebase calls `exec()` on a `LocalSandbox`
+        any more, but it stays implemented (returning a clear "unsupported"
+        result rather than raising) since `ISandbox` still declares it.
+        """
         logger.warning(
-            "Local sandbox received an unrecognized command",
+            "Local sandbox received an exec() call; this backend supports no commands",
             extra={"sandbox_id": self.id, "command": command[:200]},
         )
         return SandboxExecResult(
             exit_code=127,
             stdout="",
-            stderr=f"local sandbox does not support this command: {command!r}",
+            stderr="local sandbox does not support exec() — use a typed ISandbox operation instead",
         )
 
     async def destroy(self) -> None:
@@ -146,63 +129,72 @@ class LocalSandbox:
             return SandboxExecResult(exit_code=1, stdout="", stderr=str(exc))
         return SandboxExecResult(exit_code=0, stdout="", stderr="")
 
-    # -- exec() command implementations --------------------------------------
+    async def find_files(self, path: str, *, max_depth: int, limit: int) -> SandboxExecResult:
+        """List files under `path`, depth-bounded. See `ISandbox.find_files`."""
+        return await asyncio.to_thread(self._find_files, path, max_depth, limit)
 
-    def _find_files(self, cwd: Path, match: re.Match) -> SandboxExecResult:
-        tokens = _split_shell_words(match.group("target"))
-        if not tokens:
-            return SandboxExecResult(exit_code=2, stdout="", stderr="could not parse target path")
+    def _find_files(self, path: str, max_depth: int, limit: int) -> SandboxExecResult:
         try:
-            target = self._enforce_within_workspace(cwd / tokens[0])
+            target = self._resolve_workspace_path(path)
         except ValueError as exc:
             return SandboxExecResult(exit_code=2, stdout="", stderr=str(exc))
-        max_depth = int(match.group("depth"))
-        limit = int(match.group("limit"))
 
         if not target.exists():
             return SandboxExecResult(exit_code=1, stdout="", stderr=f"{target}: No such file or directory")
 
-        root_depth = len(target.resolve().parts)
+        root_depth = len(target.parts)
         files: list[str] = []
-        for path in sorted(target.rglob("*")):
-            if not path.is_file():
+        for candidate in sorted(target.rglob("*")):
+            if not candidate.is_file():
                 continue
-            if len(path.resolve().parts) - root_depth > max_depth:
+            if len(candidate.parts) - root_depth > max_depth:
                 continue
-            files.append(str(path))
+            files.append(self._relative_output_path(candidate))
             if len(files) >= limit:
                 break
         return SandboxExecResult(exit_code=0, stdout="\n".join(files), stderr="")
 
-    def _grep(self, cwd: Path, match: re.Match) -> SandboxExecResult:
-        tokens = _split_shell_words(match.group("rest"))
-        if not tokens or len(tokens) != 2:
-            return SandboxExecResult(exit_code=2, stdout="", stderr="could not parse pattern/target")
-        pattern, target_token = tokens
+    async def grep_files(self, pattern: str, path: str, *, limit: int) -> SandboxExecResult:
+        """Literal content search under `path`. See `ISandbox.grep_files`."""
+        return await asyncio.to_thread(self._grep_files, pattern, path, limit)
+
+    def _grep_files(self, pattern: str, path: str, limit: int) -> SandboxExecResult:
         try:
-            target = self._enforce_within_workspace(cwd / target_token)
+            target = self._resolve_workspace_path(path)
         except ValueError as exc:
             return SandboxExecResult(exit_code=2, stdout="", stderr=str(exc))
-        limit = int(match.group("limit"))
 
         if not target.exists():
             return SandboxExecResult(exit_code=2, stdout="", stderr=f"{target}: No such file or directory")
 
-        paths = [target] if target.is_file() else [p for p in sorted(target.rglob("*")) if p.is_file()]
+        candidates = [target] if target.is_file() else [p for p in sorted(target.rglob("*")) if p.is_file()]
         matches: list[str] = []
-        for path in paths:
+        for candidate in candidates:
             try:
-                text = path.read_text(errors="replace")
+                text = candidate.read_text(errors="replace")
             except OSError:
                 continue
+            relative = self._relative_output_path(candidate)
             for lineno, line in enumerate(text.splitlines(), start=1):
                 if pattern in line:
-                    matches.append(f"{path}:{lineno}:{line}")
+                    matches.append(f"{relative}:{lineno}:{line}")
                     if len(matches) >= limit:
                         return SandboxExecResult(exit_code=0, stdout="\n".join(matches), stderr="")
 
         exit_code = 0 if matches else 1  # grep's own convention: 1 means "no matches", not a failure
         return SandboxExecResult(exit_code=exit_code, stdout="\n".join(matches), stderr="")
+
+    def _relative_output_path(self, candidate: Path) -> str:
+        """Render a matched path relative to the workspace root, POSIX-style.
+
+        `find_files`/`grep_files` used to build their output from an absolute
+        host path (inherited from the old shell-command-string era) — this is
+        what fixed that: results now line up with `ChangedFile.filename`'s own
+        shape (e.g. `"repo/app/main.py"`) and never leak the host's directory
+        layout (temp dir name, local username, ...) into agent context or,
+        ultimately, a published review comment.
+        """
+        return candidate.relative_to(self._workspace.resolve()).as_posix()
 
     def _resolve_workspace_path(self, relative_path: str) -> Path:
         return self._enforce_within_workspace(self._workspace / relative_path)
