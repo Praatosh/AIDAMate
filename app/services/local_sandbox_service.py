@@ -6,16 +6,18 @@ this backend runs the exact same read-only inspection operations (list
 files, grep, extract the downloaded archive) directly on the host
 filesystem inside a scratch temp directory. Nothing from the PR is ever
 executed as code here — only read, listed, or grepped, the same guarantee
-the sandbox tools already provide — but the OS-level isolation
-`docker sandbox` gives is gone.
+the sandbox tools already provide — but the OS-level isolation `sbx` gives
+is gone.
 
-Exists because this session confirmed Docker Sandboxes cannot run on this
-particular machine: Docker Desktop's engine requires a WSL2 kernel update
-that cannot be installed without admin rights. Selected via
-`SANDBOX_MODE=local`; the default remains `docker`. Swap back once a working
-Docker Sandbox host is available — nothing downstream (tools, orchestrator,
-risk engine) needs to change, since both backends satisfy the same
-`ISandbox`/`ISandboxFactory` Protocols.
+Exists for hosts that genuinely cannot run Docker Sandboxes at all (e.g. no
+admin rights to install a WSL2 kernel update Docker Desktop's engine needs)
+— not this project's own development machine specifically, despite an
+earlier session's note to that effect: `sbx` (the current CLI; see
+`sandbox_service.py`) is live-verified working here. Selected via
+`SANDBOX_MODE=local`; the default remains `docker`. Swap back to `docker`
+mode wherever `sbx` will actually run — nothing downstream (tools,
+orchestrator, risk engine) needs to change, since both backends satisfy the
+same `ISandbox`/`ISandboxFactory` Protocols.
 
 `exec()` here does not run an arbitrary shell. AIDA-MATE's own code is the only
 caller — the LLM only ever supplies tool *arguments* (a path, a search

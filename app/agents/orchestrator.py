@@ -84,7 +84,7 @@ _ARCHIVE_FILENAME = "archive.tar.gz"
 #: directory; stripping it is what makes in-sandbox paths match
 #: `ChangedFile.filename` (e.g. `app/auth/middleware.py`, not
 #: `acme-api-3f2c9ab/app/auth/middleware.py`). Standard GitHub tarball
-#: layout — not one of the `docker sandbox` CLI facts verified this session,
+#: layout — not one of the `sbx` CLI facts verified this session,
 #: worth a real-download sanity check before relying on it in production.
 _EXTRACT_COMMAND = (
     f"mkdir -p {SANDBOX_REPO_DIR} && "

@@ -1,7 +1,10 @@
 """Docker Sandboxes adapter: subprocess construction, file I/O, cleanup.
 
 Every `asyncio.create_subprocess_exec` call is mocked — no real Docker
-Desktop, no real `docker sandbox` binary, is required to run this suite.
+Desktop, no real `sbx` binary, is required to run this suite. Command shapes
+asserted here are the ones verified live this session against the real
+`sbx` CLI (create, exec, rm) — see `app/services/sandbox_service.py`'s
+module docstring.
 """
 
 import asyncio
@@ -33,24 +36,26 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def sandbox(workspace: Path) -> SbxSandbox:
-    return SbxSandbox(
-        "aida-mate-test1234", workspace=workspace, binary="docker", default_timeout_s=30
-    )
+    return SbxSandbox("aida-mate-test1234", workspace=workspace, binary="sbx", default_timeout_s=30)
 
 
 # --- Factory: create() --------------------------------------------------------
 
 
-async def test_create_raises_when_docker_is_not_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+async def test_create_raises_when_sbx_is_not_on_path(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     monkeypatch.setattr("shutil.which", lambda _: None)
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
 
     with pytest.raises(SandboxUnavailableError, match="PATH"):
         await factory.create()
 
 
-async def test_create_invokes_create_then_run(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+async def test_create_invokes_a_single_create_call(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """Unlike the old `docker sandbox` plugin, `sbx create` both provisions
+    and starts the sandbox — confirmed live: `sbx exec` worked immediately
+    after `create`, with no intermediate `sbx run` call. Only one subprocess
+    call should happen here."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     calls: list[list[str]] = []
 
     async def fake_subprocess_exec(*argv, **kwargs):
@@ -58,23 +63,22 @@ async def test_create_invokes_create_then_run(monkeypatch: pytest.MonkeyPatch, t
         return _fake_process(returncode=0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
 
     sandbox = await factory.create(labels={"review_id": "abcd1234-xxxx"})
 
-    assert len(calls) == 2
-    assert calls[0][:3] == ["docker", "sandbox", "create"]
-    assert calls[0][3:5] == ["--name", sandbox.id]
-    assert calls[0][5] == "shell"
-    assert calls[1] == ["docker", "sandbox", "run", sandbox.id]
+    assert len(calls) == 1
+    assert calls[0][:2] == ["sbx", "create"]
+    assert calls[0][2] == "shell"
+    assert calls[0][-2:] == ["--name", sandbox.id]
     assert sandbox.id.startswith("aida-mate-")
 
 
 async def test_create_generates_a_name_from_the_review_id(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_fake_process()))
 
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
     sandbox = await factory.create(labels={"review_id": "3d925cae-dc83-4408"})
 
     assert sandbox.id == "aida-mate-3d925cae"
@@ -83,10 +87,10 @@ async def test_create_generates_a_name_from_the_review_id(monkeypatch: pytest.Mo
 async def test_create_generates_a_random_name_without_a_review_id(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_fake_process()))
 
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
     a = await factory.create()
     b = await factory.create()
 
@@ -95,83 +99,38 @@ async def test_create_generates_a_random_name_without_a_review_id(
 
 
 async def test_create_makes_an_empty_workspace_directory(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=_fake_process()))
 
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
     sandbox = await factory.create()
 
     assert sandbox._workspace.is_dir()
     assert list(sandbox._workspace.iterdir()) == []
 
 
-async def test_create_raises_on_nonzero_exit_from_create_subcommand(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+async def test_create_raises_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     monkeypatch.setattr(
         asyncio,
         "create_subprocess_exec",
         AsyncMock(return_value=_fake_process(returncode=1, stderr=b"daemon not running")),
     )
 
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
 
     with pytest.raises(SandboxUnavailableError, match="daemon not running"):
-        await factory.create()
-
-
-async def test_create_gives_a_clear_message_when_docker_sandbox_is_deprecated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    """Docker's own deprecation notice ('"docker sandbox" is deprecated and
-    has been removed...') must not surface as a generic exit-code dump — an
-    operator debugging every review failing needs to know this is a
-    permanent, unrelated-to-their-setup condition, not a Docker Desktop
-    problem to chase. See CLAUDE.md §6."""
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
-    monkeypatch.setattr(
-        asyncio,
-        "create_subprocess_exec",
-        AsyncMock(
-            return_value=_fake_process(
-                returncode=1,
-                stderr=b'"docker sandbox" is deprecated and has been removed.\n\n'
-                b"Please migrate to Docker Sandboxes: https://www.docker.com/products/docker-sandboxes",
-            )
-        ),
-    )
-
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
-
-    with pytest.raises(SandboxUnavailableError, match="deprecated and removed by Docker"):
-        await factory.create()
-
-
-async def test_create_raises_on_nonzero_exit_from_run_subcommand(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
-) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
-    responses = [_fake_process(returncode=0), _fake_process(returncode=1, stderr=b"boom")]
-
-    async def fake_subprocess_exec(*argv, **kwargs):
-        return responses.pop(0)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess_exec)
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
-
-    with pytest.raises(SandboxUnavailableError, match="boom"):
         await factory.create()
 
 
 async def test_failed_create_cleans_up_the_workspace_directory(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
     monkeypatch.setattr(
         asyncio, "create_subprocess_exec", AsyncMock(return_value=_fake_process(returncode=1))
     )
-    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
 
     with pytest.raises(SandboxUnavailableError):
         await factory.create()
@@ -269,7 +228,7 @@ async def test_exec_command_is_run_through_a_shell(
     await sandbox.exec("echo hi | wc -l")
 
     argv = captured[0]
-    assert argv[:3] == ["docker", "sandbox", "exec"]
+    assert argv[:2] == ["sbx", "exec"]
     assert argv[-3:] == ["sh", "-c", "echo hi | wc -l"]
     assert argv[-4] == sandbox.id
 
@@ -290,11 +249,19 @@ async def test_exec_passes_cwd_as_workdir_flag(monkeypatch: pytest.MonkeyPatch, 
     assert captured[0][captured[0].index("--workdir") + 1] == "/workspace/repo"
 
 
-async def test_exec_without_cwd_defaults_to_the_workspace_root(
-    monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox, workspace: Path
+async def test_exec_without_cwd_omits_the_workdir_flag(
+    monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox
 ) -> None:
-    """Relative paths built by the sandbox tools assume this default holds —
-    it must not depend on whatever `docker sandbox exec` picks on its own."""
+    """Regression: the previous adapter (against `docker sandbox`, whose own
+    default cwd wasn't documented) always passed `--workdir` explicitly,
+    computed from the host-side workspace path. Confirmed live this session
+    that doing the equivalent against `sbx` is actively wrong on Windows —
+    the container mounts the workspace at a POSIX-translated path, not the
+    literal host path, so passing the host path as `--workdir` fails with
+    "No such file or directory" (reproduced live). `sbx exec` already
+    defaults its own cwd to the mounted workspace when `--workdir` is
+    omitted (also confirmed live), so `cwd=None` must not add the flag at
+    all rather than substituting a computed path."""
     captured: list[list[str]] = []
 
     async def fake_subprocess_exec(*argv, **kwargs):
@@ -305,8 +272,7 @@ async def test_exec_without_cwd_defaults_to_the_workspace_root(
 
     await sandbox.exec("ls")
 
-    assert "--workdir" in captured[0]
-    assert captured[0][captured[0].index("--workdir") + 1] == str(workspace.resolve())
+    assert "--workdir" not in captured[0]
 
 
 async def test_exec_times_out_and_kills_the_local_process(
@@ -332,7 +298,7 @@ async def test_exec_times_out_and_kills_the_local_process(
 async def test_exec_uses_the_default_timeout_when_none_given(
     monkeypatch: pytest.MonkeyPatch, workspace: Path
 ) -> None:
-    sandbox = SbxSandbox("s1", workspace=workspace, binary="docker", default_timeout_s=0.01)
+    sandbox = SbxSandbox("s1", workspace=workspace, binary="sbx", default_timeout_s=0.01)
     process = _fake_process()
 
     async def hang_forever():
@@ -348,7 +314,9 @@ async def test_exec_uses_the_default_timeout_when_none_given(
 # --- destroy ---------------------------------------------------------------
 
 
-async def test_destroy_invokes_sandbox_rm(monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox) -> None:
+async def test_destroy_invokes_rm_with_force(monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox) -> None:
+    """`--force` is required — confirmed live: `sbx rm` otherwise asks for
+    interactive confirmation, which would hang this non-interactive call."""
     captured: list[list[str]] = []
 
     async def fake_subprocess_exec(*argv, **kwargs):
@@ -359,7 +327,7 @@ async def test_destroy_invokes_sandbox_rm(monkeypatch: pytest.MonkeyPatch, sandb
 
     await sandbox.destroy()
 
-    assert captured[0] == ["docker", "sandbox", "rm", sandbox.id]
+    assert captured[0] == ["sbx", "rm", sandbox.id, "--force"]
 
 
 async def test_destroy_removes_the_workspace_directory(
@@ -387,7 +355,7 @@ async def test_destroy_never_raises_when_the_subprocess_itself_fails_to_launch(
     monkeypatch: pytest.MonkeyPatch, sandbox: SbxSandbox
 ) -> None:
     async def raise_oserror(*a, **k):
-        raise OSError("docker not found")
+        raise OSError("sbx not found")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", raise_oserror)
 

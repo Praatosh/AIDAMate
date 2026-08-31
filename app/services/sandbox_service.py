@@ -1,22 +1,36 @@
 """Docker Sandboxes adapter, implementing `ISandbox`/`ISandboxFactory`.
 
-Wraps the `docker sandbox` CLI plugin (verified installed and working via its
-own `--help` output — not the public docs, which describe a differently-shaped
-standalone `sbx` binary with a `cp` subcommand that does not exist here).
+Wraps the standalone `sbx` CLI — Docker's current "Docker Sandboxes" product,
+confirmed live this session as the actual replacement for the `docker
+sandbox` CLI plugin this file previously wrapped, which Docker has since
+deprecated and removed (see CLAUDE.md §6). `sbx` is its own top-level binary
+with its own subcommands, not a `docker <subcommand>` plugin invocation —
+verified against its own `--help` output for every subcommand used here, and
+against a full live create -> exec -> rm cycle, not assumed from Docker's
+public marketing docs.
 
 The real command surface, confirmed this session:
 
-    docker sandbox create [--name NAME] shell WORKSPACE
-    docker sandbox run SANDBOX
-    docker sandbox exec [-w WORKDIR] SANDBOX COMMAND [ARG...]   # non-interactive by default
-    docker sandbox rm SANDBOX
-    docker sandbox ls --json
+    sbx create shell WORKSPACE --name NAME   # creates AND starts — no separate "run" step
+    sbx exec [--workdir DIR] SANDBOX COMMAND [ARG...]   # auto-starts if stopped; non-interactive by default
+    sbx rm SANDBOX --force                   # --force skips the confirmation prompt `sbx rm` asks otherwise
+    sbx ls --json
 
-There is no `cp` subcommand. `create shell WORKSPACE` bind-mounts a host
-directory into the sandbox at the *identical path* instead — so `upload_bytes`
-writes directly to that mounted directory rather than shelling out to copy
-anything. This is simpler than the `cp`-based design the plan started from,
-and was adopted specifically because it matches what's actually installed.
+`create shell WORKSPACE` bind-mounts a host directory into the sandbox, so
+`upload_bytes`/`read_file` operate on that mounted directory directly rather
+than shelling out to copy anything — unchanged from the previous adapter.
+There is still no `cp`-based transfer needed for this app's use case.
+
+One live-verified, Windows-specific gotcha `exec()` accounts for: the
+container does NOT mount the workspace at the literal host path. On this
+Windows host, `C:\\Users\\...\\workspace` is visible inside the sandbox at a
+POSIX-translated path (e.g. `/c/Users/.../workspace`) — passing the raw host
+path as `--workdir` fails with "No such file or directory" (reproduced
+live). `sbx exec` already defaults its own working directory to the
+sandbox's mounted workspace when `--workdir` is omitted, so `exec()` simply
+omits the flag in the common case (every caller in this codebase calls
+`exec()` with `cwd=None`) rather than trying to compute the in-container
+path itself.
 
 The workspace directory is created empty per sandbox and holds only whatever
 this service writes into it (the downloaded PR archive) — AIDA-MATE never
@@ -35,10 +49,6 @@ from app.core.logging import get_logger
 
 logger = get_logger(__name__)
 
-#: Path inside the sandbox VM that mirrors the host workspace directory.
-#: `create shell WORKSPACE` documents this as "exposed at the same path as on
-#: the host" — so the in-sandbox path is only knowable once the host temp
-#: directory exists, which is why `create()` generates it first.
 _MAX_HELP_OUTPUT_CHARS = 2000
 
 
@@ -87,23 +97,29 @@ class SbxSandbox:
     ) -> SandboxExecResult:
         """Run `command` inside the sandbox via a POSIX shell, non-interactively.
 
-        `docker sandbox exec` runs non-interactively and captures output by
-        default — confirmed via its `--help` text, which lists `-i`/`-t` as
-        opt-in flags rather than the only mode. Commands are always passed
-        through `sh -c` (rather than split into argv) so callers can use shell
-        features (pipes, redirects) the same way the sandbox tools already
-        assume; the *contents* of `command` are the caller's responsibility to
-        have shell-escaped (see `app/tools/sandbox_tools.py`).
+        `sbx exec` runs non-interactively and captures output by default —
+        confirmed via its `--help` text (`-i`/`-t` are opt-in flags) and live
+        testing. Commands are always passed through `sh -c` (rather than split
+        into argv) so callers can use shell features (pipes, redirects) the
+        same way the sandbox tools already assume; the *contents* of `command`
+        are the caller's responsibility to have shell-escaped (see
+        `app/tools/sandbox_tools.py`).
 
-        `cwd` defaults to the sandbox's mounted workspace root, not whatever
-        `docker sandbox exec` would otherwise pick — that default isn't
-        documented, and callers (the extraction step, the sandbox tools) build
-        paths relative to the workspace, so leaving this to chance would make
-        relative-path resolution depend on an unconfirmed CLI behavior instead
-        of something this adapter controls and can be tested.
+        `--workdir` is only passed when `cwd` is explicitly given. When `cwd`
+        is None (every caller in this codebase), `sbx exec` is left to apply
+        its own default, which is already the sandbox's mounted workspace —
+        confirmed live. Explicitly computing and passing the workspace path
+        here (the previous adapter's approach against `docker sandbox`, whose
+        undocumented default couldn't be trusted) would be actively wrong on
+        this host: the container mounts the workspace at a POSIX-translated
+        path, not the literal Windows host path this class holds — see the
+        module docstring. A caller that supplies its own `cwd` is responsible
+        for passing a path valid *inside* the container.
         """
-        effective_cwd = cwd if cwd is not None else str(self._workspace.resolve())
-        argv = [self._binary, "sandbox", "exec", "--workdir", effective_cwd, self.id, "sh", "-c", command]
+        argv = [self._binary, "exec"]
+        if cwd is not None:
+            argv += ["--workdir", cwd]
+        argv += [self.id, "sh", "-c", command]
 
         effective_timeout = timeout_s if timeout_s is not None else self._default_timeout_s
 
@@ -144,10 +160,12 @@ class SbxSandbox:
 
         Never raises, per the `ISandbox` contract: this always runs from a
         `finally` block, and a cleanup failure must never mask the error that
-        triggered cleanup in the first place. Both the `docker sandbox rm` call
-        and the workspace removal are individually best-effort.
+        triggered cleanup in the first place. Both the `sbx rm` call and the
+        workspace removal are individually best-effort. `--force` is required
+        — confirmed live: `sbx rm` otherwise asks for interactive confirmation,
+        which would hang this non-interactive subprocess indefinitely.
         """
-        argv = [self._binary, "sandbox", "rm", self.id]
+        argv = [self._binary, "rm", self.id, "--force"]
         try:
             process = await asyncio.create_subprocess_exec(
                 *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -155,12 +173,12 @@ class SbxSandbox:
             _, stderr = await process.communicate()
             if process.returncode != 0:
                 logger.warning(
-                    "docker sandbox rm returned nonzero",
+                    "sbx rm returned nonzero",
                     extra={"sandbox_id": self.id, "stderr": stderr.decode(errors="replace")[:500]},
                 )
         except OSError as exc:
             logger.warning(
-                "Failed to invoke docker sandbox rm",
+                "Failed to invoke sbx rm",
                 extra={"sandbox_id": self.id, "error": str(exc)},
             )
 
@@ -186,12 +204,12 @@ class SbxSandbox:
 
 
 class SbxSandboxFactory:
-    """Creates `SbxSandbox` instances via `docker sandbox create shell`."""
+    """Creates `SbxSandbox` instances via `sbx create shell`."""
 
     def __init__(
         self,
         *,
-        binary: str = "docker",
+        binary: str = "sbx",
         workdir_root: str | Path | None = None,
         default_timeout_s: float = 900,
     ) -> None:
@@ -202,15 +220,21 @@ class SbxSandboxFactory:
     async def create(self, *, labels: dict[str, str] | None = None) -> SbxSandbox:
         """Provision a fresh, agent-less sandbox with an empty mounted workspace.
 
+        A single `sbx create shell` call both provisions and starts the
+        sandbox — unlike the old `docker sandbox` plugin, there is no separate
+        "run" step (confirmed live: `sbx exec` succeeded immediately after
+        `create`, with no intermediate `sbx run` call).
+
         Raises:
-            SandboxUnavailableError: if the `docker` binary isn't on PATH, or
-                `docker sandbox create` fails (commonly because Docker Desktop
-                / the sandbox daemon isn't running — `docker sandbox version`
-                reports "Server Version: Unavailable" in that case).
+            SandboxUnavailableError: if the `sbx` binary isn't on PATH, or
+                `sbx create` fails (commonly because Docker Desktop / the
+                sandbox daemon isn't running, or the one-time interactive
+                `sbx login` this app cannot perform on its own hasn't been done).
         """
         if shutil.which(self._binary) is None:
             raise SandboxUnavailableError(
-                f"'{self._binary}' is not on PATH. Install Docker Desktop and ensure it's running."
+                f"'{self._binary}' is not on PATH. Install Docker Sandboxes "
+                "(https://www.docker.com/products/docker-sandboxes) and ensure Docker Desktop is running."
             )
 
         review_id = (labels or {}).get("review_id", "")
@@ -220,7 +244,7 @@ class SbxSandboxFactory:
             lambda: Path(tempfile.mkdtemp(prefix=f"{name}-", dir=self._workdir_root))
         )
 
-        argv = [self._binary, "sandbox", "create", "--name", name, "shell", str(workspace)]
+        argv = [self._binary, "create", "shell", str(workspace), "--name", name]
         process = await asyncio.create_subprocess_exec(
             *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
@@ -228,40 +252,9 @@ class SbxSandboxFactory:
 
         if process.returncode != 0:
             shutil.rmtree(workspace, ignore_errors=True)
-            stderr_text = stderr.decode(errors="replace")
-            if "deprecated" in stderr_text.lower() and "removed" in stderr_text.lower():
-                # Docker has discontinued the `docker sandbox` CLI plugin this
-                # whole adapter is built on (confirmed live — see CLAUDE.md §6).
-                # A generic exit-code-and-stderr dump would send an operator
-                # hunting for a Docker Desktop / WSL2 problem that doesn't
-                # exist; every SANDBOX_MODE=docker review would otherwise fail
-                # this way with no indication of the real, permanent cause.
-                raise SandboxUnavailableError(
-                    "The 'docker sandbox' CLI plugin has been deprecated and removed by Docker "
-                    "(unrelated to Docker Desktop not running). This adapter has no working "
-                    "replacement yet — set SANDBOX_MODE=local (not an isolation boundary, but "
-                    "functional) or disable the sandbox stage until one is built. "
-                    f"Docker's own message: {stderr_text[:_MAX_HELP_OUTPUT_CHARS]}"
-                )
             raise SandboxUnavailableError(
-                f"docker sandbox create failed (exit {process.returncode}): "
-                f"{stderr_text[:_MAX_HELP_OUTPUT_CHARS]}"
-            )
-
-        # `create` provisions the sandbox definition; `run` starts it so `exec`
-        # has something live to attach to. Confirmed as two distinct steps via
-        # `docker sandbox run --help` ("Create the sandbox if it does not
-        # exist" implies `create` alone does not start it).
-        run_argv = [self._binary, "sandbox", "run", name]
-        run_process = await asyncio.create_subprocess_exec(
-            *run_argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        _, run_stderr = await run_process.communicate()
-        if run_process.returncode != 0:
-            shutil.rmtree(workspace, ignore_errors=True)
-            raise SandboxUnavailableError(
-                f"docker sandbox run failed (exit {run_process.returncode}): "
-                f"{run_stderr.decode(errors='replace')[:_MAX_HELP_OUTPUT_CHARS]}"
+                f"sbx create failed (exit {process.returncode}): "
+                f"{stderr.decode(errors='replace')[:_MAX_HELP_OUTPUT_CHARS]}"
             )
 
         logger.info("Sandbox created", extra={"sandbox_id": name, "workspace": str(workspace)})

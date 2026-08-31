@@ -1341,6 +1341,54 @@ tests — worth knowing so the same class of bug doesn't come back:
   severity coercion, 1 for the dashboard `ensure()` guard, 2 for
   cancellation handling, 1 for the sandbox error message). Full suite
   (1210 tests) green, `ruff check` clean.
+- **The Docker Sandbox adapter now targets `sbx`, live-verified — the
+  "no verified replacement spec" reason the previous entry gave for not
+  building one no longer holds.** A follow-up finding pointed at "Docker's
+  documented sbx CLI"; unlike the earlier vague "public docs describe a
+  differently-shaped standalone `sbx` binary" note (§6, written when
+  `docker sandbox` still worked and nobody had reason to look closer), this
+  time `sbx --help` and every subcommand's own `--help` were read directly
+  — `sbx` turned out to be a real, currently-installed, fully-documented
+  binary on this machine (`C:\Users\...\DockerSandboxes\bin\sbx.exe`,
+  `sbx version` reports v0.38.0), not a hypothetical. Verified with a full
+  live cycle through the actual rewritten adapter code (not just manual CLI
+  probing): `SbxSandboxFactory.create()` → `SbxSandbox.upload_bytes()` →
+  `.exec()` → `.read_file()` → `.destroy()`, all against the real `sbx`
+  binary, before trusting any of this. Command surface changed shape
+  entirely, not just the binary name: `sbx <subcommand>` directly (`sbx
+  create`, `sbx exec`, `sbx rm`), not `docker sandbox <subcommand>`.
+  `sbx create shell WORKSPACE --name NAME` both provisions and starts the
+  sandbox in one step — confirmed live that `exec` worked immediately after
+  `create` with no separate `run` call needed, unlike the old plugin.
+  `sbx rm SANDBOX --force` needs `--force`, or it blocks on an interactive
+  confirmation prompt that would hang this app's non-interactive subprocess
+  call forever (also confirmed live). **A genuine, Windows-specific gotcha
+  found only by testing, not readable from `--help` text**: the sandbox
+  does NOT mount the workspace at the literal host path — a Windows path
+  like `C:\Users\...\workspace` is visible inside the Linux container at a
+  POSIX-translated path (`/c/Users/.../workspace`); passing the raw host
+  path as `sbx exec --workdir` fails with "No such file or directory"
+  (reproduced live before fixing). Since `sbx exec` already defaults its
+  own cwd to the mounted workspace when `--workdir` is omitted (also
+  confirmed live) and every caller in this codebase calls `exec()` with
+  `cwd=None`, the fix is to simply omit `--workdir` in that case rather
+  than computing and passing a path — the previous adapter's approach
+  (always passing an explicit `--workdir`, because `docker sandbox`'s own
+  default wasn't documented) would be actively wrong against `sbx` on this
+  host. `SANDBOX_BINARY` default changed `docker` → `sbx`
+  (`app/core/config.py`); `.env.example`, `README.md` (setup steps and the
+  status table), `ARCHITECTURE.md` (two spots, one via an explicit
+  "correction, preserved" note rather than silently rewriting the old
+  claim — same pattern §6 already uses), and stray docstring references in
+  `orchestrator.py`/`errors.py`/`main.py`/`local_sandbox_service.py` all
+  updated to match. `local_sandbox_service.py`'s own claim that Docker
+  Sandboxes "cannot run on this particular machine" was corrected the same
+  way. Test suite rewritten against the new command shapes (the old
+  create-then-run two-call assertion, the always-pass-`--workdir` default,
+  and the `docker sandbox`-deprecation-message-detection test — that
+  message only ever came from the old plugin's stderr and can no longer
+  occur — all replaced; net two fewer tests, same coverage per current
+  behavior). Full suite (1208 tests) green, `ruff check` clean.
 
 ## 9. Standing working agreements with this user
 

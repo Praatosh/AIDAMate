@@ -58,7 +58,7 @@ def test_readiness_reports_ready_with_a_sandbox(monkeypatch: pytest.MonkeyPatch)
 
 def test_readiness_never_leaks_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     """`/ready`'s response schema is booleans only — no secret should ever
-    reach it, regardless of which credential is set. `docker sandbox` itself
+    reach it, regardless of which credential is set. `sbx` itself
     needs no secret (auth is an out-of-band `sbx login`), so this exercises
     the GitHub credential instead.
     """

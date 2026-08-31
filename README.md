@@ -47,7 +47,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design: sequence diagram, co
 | GitHub integration | Reads, writes, archive download, App + dev-token auth | ✅ **Complete** |
 | Deterministic engines | Area detection, risk scoring, label derivation | ✅ **Complete** |
 | Publication | GitHub labels + comment, Linear comment/activity | ✅ **Complete** |
-| Sandbox | `docker sandbox` CLI adapter, plus a `SANDBOX_MODE=local` Docker-free stopgap | ✅ **Complete** — `docker` mode confirmed non-functional on this dev host (WSL2 required, no admin); `local` mode live-verified |
+| Sandbox | `sbx` CLI adapter (Docker Sandboxes), plus a `SANDBOX_MODE=local` Docker-free stopgap | ✅ **Complete** — both modes live-verified on this dev host (`sbx` create/exec/remove cycle, and `local`) |
 | Review agent | 6-agent pipeline behind one `analyze()` call: Context Agent, four concurrent specialists (Security/Code/Architecture/Testing), a Judge that reconciles into one result | ✅ **Complete and live-verified** (709 tests, `ruff` clean, plus a real run — see below) |
 | Persistence | SQLite-backed job store (`REVIEW_STORE_PATH`) with restart recovery; file-backed Linear OAuth (`LINEAR_TOKEN_STORE_PATH`) | ✅ **Complete** |
 | Live end-to-end run | Real PR, real Linear workspace, real AI agent | ✅ **Done** — two runs of the earlier single-agent pipeline (one real finding, one legitimate zero-findings result), plus one real run of the new 6-agent pipeline (`sentinel-trading-bot#6`: HIGH/288, 6 reconciled findings, 11 tool calls across 4 genuinely concurrent specialists) |
@@ -173,35 +173,24 @@ Startup **fails fast** on invalid configuration and logs a warning for every mis
 
 ## Sandbox setup (Docker Sandboxes)
 
-AIDA-MATE uses the **`docker sandbox`** CLI plugin (bundled with recent Docker Desktop releases — confirmed installed and working this session; the standalone `sbx` binary the public docs describe is not required on this stack) to isolate PR content from the host.
+AIDA-MATE uses **`sbx`**, Docker's standalone CLI for its "Docker Sandboxes" product, to isolate PR content from the host — live-verified this session (a full create → exec → remove cycle). The older `docker sandbox` CLI *plugin* AIDA-MATE originally targeted has since been deprecated and removed by Docker; `sbx` is its replacement and is not a `docker <subcommand>` plugin invocation.
 
 ```bash
-# 1. Install/start Docker Desktop
-# https://www.docker.com/products/docker-desktop/
+# 1. Install Docker Sandboxes (https://www.docker.com/products/docker-sandboxes)
+#    and start Docker Desktop.
 
 # 2. Confirm Docker is running
 docker info
 
-# 3. Confirm the Sandbox plugin is installed
-docker sandbox version
+# 3. Confirm sbx is installed
+sbx version
 
-# 4. Authenticate with GitHub
-gh auth login
+# 4. One-time interactive login
+sbx login
 
-# 5. Verify GitHub authentication
-gh auth status
-
-# 6. Store the GitHub token for Docker Sandbox
-echo "$(gh auth token)" | docker sandbox secret set github
-
-# 7. Navigate to the AIDA-MATE project
-cd path/to/AIDA-MATE
-
-# 8. Start a sandbox with the required coding agent
-docker sandbox run <agent>
-
-# 9. List active sandboxes
-docker sandbox ls
+# 5. List active sandboxes (AIDA-MATE creates/removes its own per review;
+#    this is just for checking the CLI works end-to-end)
+sbx ls
 ```
 
 **Unlike the earlier Daytona-based design, the sandbox is optional.** Without it, `/ready` reports `"sandbox": false` and reviews still run the full deterministic area/risk/label pipeline — just without AI-generated findings layered on top. There is no "fails closed" behavior tied to the sandbox.

@@ -205,7 +205,7 @@ class Settings(BaseSettings):
         ),
     )
 
-    # --- Sandbox (Docker Sandboxes, `docker sandbox` CLI) -------------------
+    # --- Sandbox (Docker Sandboxes, the standalone `sbx` CLI) ----------------
     sandbox_mode: SandboxMode = Field(
         default=SandboxMode.DOCKER,
         description=(
@@ -216,11 +216,13 @@ class Settings(BaseSettings):
         ),
     )
     sandbox_binary: str = Field(
-        default="docker",
+        default="sbx",
         description=(
-            "Executable used for sandbox operations, invoked as `<binary> sandbox <subcommand>` "
-            "(e.g. `docker sandbox create shell ...`). Requires Docker Desktop running, plus a "
-            "one-time interactive `sbx login` (or `docker sandbox` OAuth equivalent) this app "
+            "Executable used for sandbox operations, invoked directly as `<binary> <subcommand>` "
+            "(e.g. `sbx create shell ...`) — `sbx` is Docker's own standalone CLI for its current "
+            "\"Docker Sandboxes\" product, not a `docker <subcommand>` plugin (the older `docker "
+            "sandbox` plugin this used to invoke has been deprecated and removed by Docker). "
+            "Requires Docker Desktop running, plus a one-time interactive `sbx login` this app "
             "cannot perform on its own."
         ),
     )

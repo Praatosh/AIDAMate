@@ -26,7 +26,7 @@ def test_defaults() -> None:
     assert settings.risk_medium_max_score == 60
     assert settings.medium_requires_human_review is False
     assert settings.sandbox_timeout_seconds == 900
-    assert settings.sandbox_binary == "docker"
+    assert settings.sandbox_binary == "sbx"
     assert settings.agent_timeout_seconds == 300
     assert settings.specialist_timeout_seconds == 60
     assert settings.auto_merge_on_done_enabled is False
@@ -128,8 +128,8 @@ def test_capability_flags_reflect_missing_credentials(monkeypatch: pytest.Monkey
 
 
 def test_sandbox_configured_when_binary_is_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A pure PATH check — `docker sandbox` needs no secret."""
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    """A pure PATH check — `sbx` needs no secret."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
 
     assert Settings(_env_file=None).sandbox_configured is True
 

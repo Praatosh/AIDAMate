@@ -158,7 +158,7 @@ class SandboxError(AidaMateError):
 
 
 class SandboxUnavailableError(SandboxError):
-    """The `docker sandbox` CLI is missing, or failed to create/run a sandbox.
+    """The `sbx` CLI is missing, or failed to create/run a sandbox.
 
     The agent-enrichment stage is optional (see `ReviewOrchestrator`) — this
     error fails only that stage's review, not AIDA-MATE's deterministic

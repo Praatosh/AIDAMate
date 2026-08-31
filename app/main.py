@@ -5,7 +5,7 @@ interfaces. Everything downstream depends on the Protocols in
 `app/core/interfaces.py`, which is what keeps the GitHub / model-provider /
 sandbox swaps cheap.
 
-The sandbox (`docker sandbox` CLI) and the review agent (OpenAI Agents SDK)
+The sandbox (`sbx` CLI, Docker Sandboxes) and the review agent (OpenAI Agents SDK)
 are both optional: without them, `ReviewOrchestrator` still runs its full
 deterministic area/risk/label pipeline — the same pattern already used for an
 unconfigured `github_service`.
@@ -108,7 +108,7 @@ def _log_startup_capabilities(settings: Settings) -> None:
 
     if not settings.sandbox_configured:
         logger.warning(
-            "No sandbox available ('docker' not on PATH, or Docker Desktop isn't running). "
+            "No sandbox available ('sbx' not on PATH, or Docker Desktop isn't running). "
             "Reviews will run the deterministic area/risk/label pipeline without AI-generated "
             "findings — install Docker Desktop and run 'sbx login' once to enable it."
         )
