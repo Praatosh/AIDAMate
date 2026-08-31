@@ -1,0 +1,41 @@
+# Secrets — never committed. .env.example is a template only (no real values).
+.env
+.env.*
+!.env.example
+
+# Local runtime state: SQLite review store + real Linear OAuth tokens.
+# This directory holds live credentials, not just data — must never be pushed.
+.local/
+
+# Python environment / build artifacts
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Logs from local runs
+*.log
+
+# Transient runtime artifacts from local start/stop scripts — process IDs
+# and cached tunnel URLs are meaningless outside this one machine's session.
+*.pid
+.ngrok_public_url.txt
+.ngrok.log
+ngrok.log
+server.log
+# Informal internal build notes — not meant for the company repo.
+PROGRESS_REPORT.md
+# Personal Notion-bound documentation draft — not a project doc.
+AIDAMate_Documentation.md
+AIDAMate_Documentation.pdf
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
