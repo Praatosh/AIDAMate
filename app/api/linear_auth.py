@@ -5,10 +5,11 @@ The browser-facing half of the flow only. All token handling lives in
 logic.
 """
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 
+from app.core.api_auth import require_management_api_key
 from app.core.errors import LinearError
 from app.core.logging import get_logger
 from app.services.linear_auth_service import LinearAuthService
@@ -107,11 +108,17 @@ async def callback(
     )
 
 
-@router.get("/status")
+@router.get("/status", dependencies=[Depends(require_management_api_key)])
 async def installation_status(request: Request) -> dict[str, object]:
     """List authorized workspaces.
 
-    Identity and scope only — never tokens or expiry secrets.
+    Identity and scope only — never tokens or expiry secrets. Still gated on
+    `MANAGEMENT_API_KEY` (security-audit finding, fixed here): unlike
+    `/install`/`/callback`, which must stay browser-accessible for the OAuth
+    redirect flow itself, this route has no other reason to be public and was
+    leaking every connected workspace's identity/scopes to anyone who could
+    reach the host. Applied per-route rather than at the router level so the
+    other two routes stay open.
     """
     installations = await request.app.state.linear_token_store.list_all()
     return {

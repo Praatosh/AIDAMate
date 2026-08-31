@@ -57,6 +57,13 @@ def _is_due(scheduled: ScheduledPrompt, now: datetime) -> bool:
     `hourly` case are judged without ever consulting `run_at_time`'s clock
     match beyond what each needs; `daily`/`weekly`/`monthly` all share the
     same "clock matches, and we haven't already fired in this period" shape.
+
+    A schedule missing the field its own frequency requires (possible via
+    `PATCH`, which — unlike creation — deliberately does not cross-validate
+    frequency-consistency) is treated as not due rather than left to crash
+    `timedelta`/`min` with a `None` — this is the specific defensive guard
+    `ScheduledPromptCreate`'s validation exists to make normally unreachable;
+    `PATCH`'s leniency is what makes it reachable in practice.
     """
     if scheduled.frequency == "once":
         if scheduled.last_run_at is not None:
@@ -67,6 +74,12 @@ def _is_due(scheduled: ScheduledPrompt, now: datetime) -> bool:
         )
 
     if scheduled.frequency == "hourly":
+        if scheduled.interval_hours is None or scheduled.interval_hours <= 0:
+            logger.warning(
+                "Scheduled prompt is hourly with no valid interval_hours; treating as not due",
+                extra={"scheduled_prompt_id": scheduled.id, "interval_hours": scheduled.interval_hours},
+            )
+            return False
         if scheduled.last_run_at is None:
             return True
         elapsed = now.astimezone(UTC) - scheduled.last_run_at
@@ -88,8 +101,14 @@ def _is_due(scheduled: ScheduledPrompt, now: datetime) -> bool:
         return False
 
     if scheduled.frequency == "weekly":
-        return now.weekday() == scheduled.day_of_week
+        return scheduled.day_of_week is not None and now.weekday() == scheduled.day_of_week
     if scheduled.frequency == "monthly":
+        if scheduled.day_of_month is None:
+            logger.warning(
+                "Scheduled prompt is monthly with no day_of_month; treating as not due",
+                extra={"scheduled_prompt_id": scheduled.id},
+            )
+            return False
         return now.day == _effective_day_of_month(now, scheduled.day_of_month)
     return True  # daily
 
@@ -178,7 +197,21 @@ class ScheduledPromptWorker:
                     extra={"scheduled_prompt_id": scheduled.id, "timezone": scheduled.timezone},
                 )
                 continue
-            if not _is_due(scheduled, now):
+            try:
+                due = _is_due(scheduled, now)
+            except Exception:
+                # `_is_due` already treats the known-malformed cases (a
+                # missing `interval_hours`/`day_of_month`, reachable via
+                # PATCH's lenient partial-update validation) as not-due
+                # rather than raising — this is a last-resort net for
+                # anything else, same "one bad row can't take down the
+                # whole tick" reasoning as the try/excepts below.
+                logger.exception(
+                    "Scheduled prompt worker could not evaluate due status; skipping",
+                    extra={"scheduled_prompt_id": scheduled.id},
+                )
+                continue
+            if not due:
                 continue
 
             scheduled.mark_run(now)

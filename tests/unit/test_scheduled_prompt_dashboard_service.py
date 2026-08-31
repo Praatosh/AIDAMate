@@ -321,3 +321,21 @@ async def test_ensure_returns_none_when_the_team_cannot_be_resolved(
     )
 
     assert await service.ensure("org-1") is None
+
+
+async def test_ensure_returns_none_when_find_team_id_by_key_raises(
+    scheduled_repo: InMemoryScheduledPromptRepository,
+    dashboard_repo: InMemoryScheduledPromptDashboardRepository,
+) -> None:
+    """Regression: unlike `sync()` (covered by `test_linear_error_never_
+    propagates`'s `list_teams` case), `ensure()`'s own `find_team_id_by_key`
+    call wasn't wrapped — a transient LinearError here (as opposed to
+    team_key cleanly resolving to nothing) escaped as a raw exception
+    instead of the None its callers (the web form, DefaultRepoScheduleService)
+    already handle gracefully."""
+    linear = FakeLinear(fail_on="find_team_id_by_key")
+    service = ScheduledPromptDashboardService(
+        dashboard_repo, scheduled_repo, linear, team_key="GIT", base_url="http://localhost:8000"
+    )
+
+    assert await service.ensure("org-1") is None  # must not raise

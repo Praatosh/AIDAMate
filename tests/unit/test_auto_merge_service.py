@@ -169,6 +169,46 @@ async def test_redelivery_while_pending_does_not_repost(repo: InMemoryReviewJobR
     assert linear.comments == []
 
 
+async def test_redelivery_after_decline_does_not_repost(repo: InMemoryReviewJobRepository) -> None:
+    """Regression: DECLINED wasn't in the 'already decided' guard, so a
+    redelivered Done event (Linear retries deliveries) after a human clicked
+    'No' would post a fresh confirmation request as if nothing happened."""
+    job = await repo.create(_completed_job(risk=RiskLevel.HIGH))
+    job.mark_merge_pending()
+    job.mark_merge_declined()
+    await repo.save(job)
+    linear = FakeLinear()
+    service = AutoMergeService(repo, FakeGitHub(), linear, base_url=BASE_URL)
+
+    await service.handle_issue_done(_trigger())
+
+    assert linear.comments == []
+    stored = await repo.get(job.id)
+    assert stored.merge_status is MergeStatus.DECLINED
+
+
+async def test_redelivery_after_decline_does_not_merge(repo: InMemoryReviewJobRepository) -> None:
+    """Same regression, the more serious half: without the DECLINED guard, a
+    LOW-risk job's decline (still possible if a human races a confirmation
+    page open before the job resolved LOW) followed by a redelivered Done
+    event would merge a PR the human never confirmed. Constructed directly
+    via mark_merge_declined() since normal LOW-risk jobs never reach
+    PENDING_CONFIRMATION in the first place — this proves the guard covers
+    the field regardless of how DECLINED was reached."""
+    job = await repo.create(_completed_job(risk=RiskLevel.LOW))
+    job.mark_merge_pending()
+    job.mark_merge_declined()
+    await repo.save(job)
+    github = FakeGitHub()
+    service = AutoMergeService(repo, github, FakeLinear(), base_url=BASE_URL)
+
+    await service.handle_issue_done(_trigger())
+
+    assert github.merged == []
+    stored = await repo.get(job.id)
+    assert stored.merge_status is MergeStatus.DECLINED
+
+
 # --- confirm() -----------------------------------------------------------------
 
 
@@ -235,6 +275,29 @@ async def test_confirm_approved_but_not_mergeable_is_recorded_not_raised(
 
 
 # --- Concurrency: redelivery/double-click must not race ------------------------
+
+
+async def test_confirm_and_handle_issue_done_share_the_same_lock(
+    repo: InMemoryReviewJobRepository,
+) -> None:
+    """Regression: `confirm()` previously locked by token while
+    `handle_issue_done` locked by job.id — two different keys for the same
+    job, so the two entry points only ever serialized against duplicates of
+    themselves, never against each other. Proven directly: holding the
+    job.id lock externally must block a concurrent `confirm()` call for that
+    same job until released."""
+    job = await repo.create(_completed_job(risk=RiskLevel.HIGH))
+    job.mark_merge_pending()
+    await repo.save(job)
+    service = AutoMergeService(repo, FakeGitHub(), FakeLinear(), base_url=BASE_URL)
+
+    async with service._lock_for(job.id):
+        task = asyncio.create_task(service.confirm(job.merge_confirmation_token, approved=True))
+        await asyncio.sleep(0)  # let confirm() run up to (and block on) the lock
+        assert not task.done()
+
+    result = await task
+    assert result.merge_status is MergeStatus.MERGED
 
 
 class SlowFakeGitHub:

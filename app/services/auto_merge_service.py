@@ -135,7 +135,16 @@ class AutoMergeService:
             current = await self._repository.get(job.id)
             job = current if current is not None else job
 
-            if job.merge_status in (MergeStatus.MERGED, MergeStatus.PENDING_CONFIRMATION):
+            already_decided = (MergeStatus.MERGED, MergeStatus.PENDING_CONFIRMATION, MergeStatus.DECLINED)
+            if job.merge_status in already_decided:
+                # DECLINED is a final human decision, not a transient state
+                # like FAILED — a redelivered "issue done" event (Linear
+                # retries deliveries) must not treat it as "never decided"
+                # and either merge a LOW-risk PR the human never confirmed,
+                # or spam a second confirmation request for MEDIUM/HIGH.
+                # FAILED deliberately stays out of this tuple: a merge that
+                # failed (e.g. a transient GitHub error) should still be
+                # retryable by a later redelivery.
                 logger.info(
                     "Merge already decided or pending; ignoring redelivery",
                     extra={"review_id": job.id, "merge_status": job.merge_status.value},
@@ -186,13 +195,25 @@ class AutoMergeService:
             AidaMateError: unknown token, or no confirmation is pending for it
                 (already decided, or never was).
         """
-        # Locked by the token itself rather than a job id resolved from it:
-        # the token is exactly the value two concurrent calls (e.g. a
-        # double-clicked "Yes, merge") would both carry, so it serializes the
-        # same race `_lock_for` was already built to guard against.
-        async with self._lock_for(token):
-            job = await self._repository.find_by_merge_confirmation_token(token)
-            if job is None or job.merge_status is not MergeStatus.PENDING_CONFIRMATION:
+        # Resolved before locking so the job.id is known — locked by job.id,
+        # not the token, so this shares the same lock `_handle_issue_done`
+        # uses for the same job (previously two different keys, so a
+        # redelivered "issue done" event and a confirm() call for the same
+        # job only ever serialized against duplicates of themselves, never
+        # against each other). The initial, pre-lock read is only used to
+        # find the job id; the actual decision re-reads and revalidates
+        # under the lock, same as `_handle_issue_done` does.
+        initial = await self._repository.find_by_merge_confirmation_token(token)
+        if initial is None:
+            raise AidaMateError("This merge confirmation is unknown or already decided.")
+
+        async with self._lock_for(initial.id):
+            job = await self._repository.get(initial.id)
+            if (
+                job is None
+                or job.merge_confirmation_token != token
+                or job.merge_status is not MergeStatus.PENDING_CONFIRMATION
+            ):
                 raise AidaMateError("This merge confirmation is unknown or already decided.")
 
             if not approved:
@@ -202,4 +223,4 @@ class AutoMergeService:
                 return job
 
             await self._merge(job)
-            return await self._repository.find_by_merge_confirmation_token(token)
+            return await self._repository.get(job.id)

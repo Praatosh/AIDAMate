@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.services.linear_auth_service import LINEAR_TOKEN_URL
 from app.services.linear_service import LINEAR_GRAPHQL_URL
+from tests.conftest import MANAGEMENT_API_KEY
 
 
 @pytest.fixture
@@ -135,8 +136,24 @@ def test_callback_requires_code_and_state(oauth_client) -> None:
 # --- Status -----------------------------------------------------------------
 
 
+def test_status_requires_management_api_key(oauth_client) -> None:
+    """Security-audit finding: this route leaked workspace identity/scopes to
+    anyone who could reach the host. Must reject with no key at all."""
+    response = oauth_client.get("/auth/linear/status")
+
+    assert response.status_code == 401
+
+
+def test_status_rejects_wrong_management_api_key(oauth_client) -> None:
+    response = oauth_client.get("/auth/linear/status", headers={"X-Api-Key": "wrong-key"})
+
+    assert response.status_code == 401
+
+
 def test_status_empty_before_install(oauth_client) -> None:
-    body = oauth_client.get("/auth/linear/status").json()
+    body = oauth_client.get(
+        "/auth/linear/status", headers={"X-Api-Key": MANAGEMENT_API_KEY}
+    ).json()
 
     assert body == {"count": 0, "installations": []}
 
@@ -155,7 +172,7 @@ def test_status_lists_installation_without_leaking_tokens(oauth_client) -> None:
     )["state"][0]
     oauth_client.get(f"/auth/linear/callback?code=c&state={state}")
 
-    response = oauth_client.get("/auth/linear/status")
+    response = oauth_client.get("/auth/linear/status", headers={"X-Api-Key": MANAGEMENT_API_KEY})
     body = response.json()
 
     assert body["count"] == 1

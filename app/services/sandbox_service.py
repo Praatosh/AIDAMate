@@ -228,9 +228,24 @@ class SbxSandboxFactory:
 
         if process.returncode != 0:
             shutil.rmtree(workspace, ignore_errors=True)
+            stderr_text = stderr.decode(errors="replace")
+            if "deprecated" in stderr_text.lower() and "removed" in stderr_text.lower():
+                # Docker has discontinued the `docker sandbox` CLI plugin this
+                # whole adapter is built on (confirmed live — see CLAUDE.md §6).
+                # A generic exit-code-and-stderr dump would send an operator
+                # hunting for a Docker Desktop / WSL2 problem that doesn't
+                # exist; every SANDBOX_MODE=docker review would otherwise fail
+                # this way with no indication of the real, permanent cause.
+                raise SandboxUnavailableError(
+                    "The 'docker sandbox' CLI plugin has been deprecated and removed by Docker "
+                    "(unrelated to Docker Desktop not running). This adapter has no working "
+                    "replacement yet — set SANDBOX_MODE=local (not an isolation boundary, but "
+                    "functional) or disable the sandbox stage until one is built. "
+                    f"Docker's own message: {stderr_text[:_MAX_HELP_OUTPUT_CHARS]}"
+                )
             raise SandboxUnavailableError(
                 f"docker sandbox create failed (exit {process.returncode}): "
-                f"{stderr.decode(errors='replace')[:_MAX_HELP_OUTPUT_CHARS]}"
+                f"{stderr_text[:_MAX_HELP_OUTPUT_CHARS]}"
             )
 
         # `create` provisions the sandbox definition; `run` starts it so `exec`

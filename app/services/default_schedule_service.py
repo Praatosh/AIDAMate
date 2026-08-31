@@ -9,6 +9,8 @@ repos that were already linked before this shipped. Idempotent by design
 duplicates or touches an existing schedule (auto-created or human-made).
 """
 
+import asyncio
+
 from app.core.interfaces import IScheduledPromptRepository
 from app.core.logging import get_logger
 from app.models.scheduled_prompt import ScheduledPrompt
@@ -36,10 +38,25 @@ class DefaultRepoScheduleService:
         self._scheduled_prompts = scheduled_prompt_repository
         self._dashboard = dashboard_service
         self._token_store = token_store
+        # Guards the check-then-create sequence below: two GitHub objects in
+        # the same brand-new repo can each trigger their own concurrent
+        # GitHubIssueSyncService._upsert -> ensure_for_repository call, and
+        # `list_all()` + `create()` is not atomic on its own — both could
+        # observe "no schedule yet" and both create one. A single process-
+        # wide lock (not per-repository) is enough: this only ever fires
+        # once per newly-linked repo, never on a hot path, so the extra
+        # cross-repository contention is negligible — same "in-process
+        # asyncio.Lock is enough, this doesn't run multi-process" tradeoff
+        # already established for AutoMergeService/LinearAuthService.
+        self._lock = asyncio.Lock()
 
     async def ensure_for_repository(self, repository: str) -> None:
         """No-op if `repository` already has any scheduled prompt at all
         (auto-created or human-made) — this only guarantees at-least-one."""
+        async with self._lock:
+            await self._ensure_for_repository_locked(repository)
+
+    async def _ensure_for_repository_locked(self, repository: str) -> None:
         existing = await self._scheduled_prompts.list_all()
         if any(s.repository == repository for s in existing):
             return

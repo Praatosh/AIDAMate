@@ -1,9 +1,10 @@
 """Shared-secret authentication for AIDA-MATE's own JSON management API.
 
-Protects `/reviews*` (`app/api/reviews.py`) and `/scheduled-prompts*`
-(`app/api/scheduled_prompts.py`) — the two routers in this app with no
-authentication of their own. Every other HTTP entry point already
-authenticates a different way and is deliberately left alone here:
+Protects `/reviews*` (`app/api/reviews.py`), `/scheduled-prompts*`
+(`app/api/scheduled_prompts.py`), and `GET /auth/linear/status`
+(`app/api/linear_auth.py`, applied per-route rather than at the router
+level). Every other HTTP entry point already authenticates a different way
+and is deliberately left alone here:
 
 * The two webhooks (`app/api/linear_webhook.py`, `app/api/github_webhook.py`)
   verify an HMAC signature over the raw request body.
@@ -12,6 +13,9 @@ authenticates a different way and is deliberately left alone here:
   route) gate on an unguessable bearer token embedded in their own URL —
   requiring an API key there too would break the "click the link Linear
   posted" flow they exist for.
+* `/auth/linear/install` and `/auth/linear/callback` must stay
+  browser-accessible for the OAuth redirect flow itself — a human's browser
+  hitting these has no way to attach an `X-Api-Key` header.
 
 `/scheduled-prompts/new` (the create form) and its POST handler are also
 unaffected: `scheduled_prompt_form.py` calls `create_scheduled_prompt`/

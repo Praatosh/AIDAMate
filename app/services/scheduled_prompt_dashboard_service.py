@@ -127,7 +127,20 @@ class ScheduledPromptDashboardService:
         team's dashboard failed (e.g. `team_key` doesn't resolve to a real
         team), mirroring `sync()`'s own no-op path for that case.
         """
-        team_id = await self._linear.find_team_id_by_key(self._team_key, organization_id=organization_id)
+        try:
+            team_id = await self._linear.find_team_id_by_key(self._team_key, organization_id=organization_id)
+        except LinearError as exc:
+            # `sync()` catches this around `list_teams()`; this call site
+            # was missing the equivalent, so a transient Linear failure here
+            # (as opposed to team_key cleanly resolving to nothing) escaped
+            # as a raw exception to ensure()'s callers (the web form,
+            # DefaultRepoScheduleService) instead of the None they already
+            # handle gracefully.
+            logger.warning(
+                "Could not resolve the dashboard's Linear team; dashboard not created",
+                extra={"organization_id": organization_id, "team_key": self._team_key, "error": str(exc)},
+            )
+            return None
         if team_id is None:
             logger.warning(
                 "Could not resolve the dashboard's Linear team; dashboard not created",

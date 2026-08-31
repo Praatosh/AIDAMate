@@ -335,6 +335,21 @@ async def test_creates_a_linear_issue_for_each_security_source(mappings, source_
     assert label_ids == ["label-security"]
 
 
+async def test_non_string_severity_does_not_crash_title_rendering(mappings) -> None:
+    """Regression: `severity.title()` assumed a string; GitHub's own field
+    types for this aren't verified against live traffic (see the module
+    docstring), so a numeric/other severity value must not turn this into an
+    unhandled 500 instead of a synced issue."""
+    github, linear = FakeGitHub(), FakeLinear()
+    service = GitHubIssueSyncService(mappings, github, linear, team_key=TEAM_KEY)
+
+    await service.handle_security_alert(_alert_event(details={"severity": 9}))  # must not raise
+
+    assert len(linear.created) == 1
+    _, title, _, _ = linear.created[0]
+    assert "9 severity" in title
+
+
 async def test_code_scanning_alert_finds_its_pr_via_commit(mappings) -> None:
     github = FakeGitHub(commit_pr=125)
     linear = FakeLinear()

@@ -228,6 +228,29 @@ async def test_missing_job_is_handled(repo) -> None:
     await ReviewWorker(repo, SucceedingExecutor(), None).run("does-not-exist")
 
 
+async def test_cancellation_during_execute_marks_the_job_interrupted(repo) -> None:
+    """Regression: queue shutdown (`ReviewQueue.stop()`) cancels every
+    in-flight worker task. `asyncio.CancelledError` is a `BaseException`, so
+    the existing `except AidaMateError`/`except Exception` clauses never
+    caught it — the job was left stuck at whatever intermediate status it
+    last saved (e.g. PROVISIONING) until the next startup's reconciliation
+    sweep, instead of INTERRUPTED (a known-safe, immediately-retryable
+    status) right away."""
+    job = await _job(repo)
+    worker = ReviewWorker(repo, SlowExecutor(), None)
+
+    task = asyncio.create_task(worker.run(job.id))
+    await asyncio.sleep(0)  # let it start and reach the slow executor
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stored = await repo.get(job.id)
+    assert stored.status is ReviewJobStatus.INTERRUPTED
+    assert stored.status.is_retryable is True
+
+
 async def test_pending_pipeline_executor_always_fails(repo) -> None:
     """The placeholder must never let a job look successful."""
     job = await _job(repo)
@@ -272,6 +295,24 @@ async def test_queue_rejects_when_full(repo) -> None:
     assert await queue.enqueue("a") is True
     assert await queue.enqueue("b") is True
     assert await queue.enqueue("c") is False
+
+
+async def test_queue_stop_completes_and_marks_an_in_flight_job_interrupted(repo) -> None:
+    """`stop()` must still unwind promptly (never hang on a cancelled task —
+    `asyncio.gather(..., return_exceptions=True)` already guarantees that),
+    and the job it interrupted mid-flight must land on INTERRUPTED rather
+    than being left stuck at an intermediate status."""
+    job = await _job(repo)
+    queue = ReviewQueue(ReviewWorker(repo, SlowExecutor(), None), concurrency=1)
+
+    await queue.start()
+    await queue.enqueue(job.id)
+    await asyncio.sleep(0.01)  # let the worker pick it up and reach the slow executor
+
+    await asyncio.wait_for(queue.stop(), timeout=2.0)  # must not hang
+
+    stored = await repo.get(job.id)
+    assert stored.status is ReviewJobStatus.INTERRUPTED
 
 
 async def test_queue_survives_a_defective_worker(repo) -> None:

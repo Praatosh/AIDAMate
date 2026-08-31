@@ -198,7 +198,7 @@ Reference: [Linear agent interaction](https://linear.app/developers/agent-intera
 | `review_service.py` | Intake: turns a `ReviewTrigger` into a persisted `ReviewJob` and enqueues it (two-stage dedup) |
 | `linear_service.py` | Linear GraphQL: issue fetch, attachments, comments, agent-session activities |
 | `github_service.py` | GitHub REST: PR, files, diff, commits, archive download, labels, comments |
-| `sandbox_service.py` | Docker Sandbox lifecycle via the `docker sandbox` CLI: create, upload, exec, destroy |
+| `sandbox_service.py` | Docker Sandbox lifecycle via the `docker sandbox` CLI: create, upload, exec, destroy — **known gap**: Docker has deprecated and removed this CLI plugin (confirmed live, see CLAUDE.md §6); `SANDBOX_MODE=local` (`local_sandbox_service.py`) is the working default until a replacement is built |
 | `linear_auth_service.py` | OAuth (PKCE) token exchange, refresh, revoke |
 | `pr_resolver.py` | Finds the linked PR: attachment → branch name → title/body, in that order |
 

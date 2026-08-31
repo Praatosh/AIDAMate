@@ -121,6 +121,33 @@ async def test_create_raises_on_nonzero_exit_from_create_subcommand(
         await factory.create()
 
 
+async def test_create_gives_a_clear_message_when_docker_sandbox_is_deprecated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Docker's own deprecation notice ('"docker sandbox" is deprecated and
+    has been removed...') must not surface as a generic exit-code dump — an
+    operator debugging every review failing needs to know this is a
+    permanent, unrelated-to-their-setup condition, not a Docker Desktop
+    problem to chase. See CLAUDE.md §6."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/docker")
+    monkeypatch.setattr(
+        asyncio,
+        "create_subprocess_exec",
+        AsyncMock(
+            return_value=_fake_process(
+                returncode=1,
+                stderr=b'"docker sandbox" is deprecated and has been removed.\n\n'
+                b"Please migrate to Docker Sandboxes: https://www.docker.com/products/docker-sandboxes",
+            )
+        ),
+    )
+
+    factory = SbxSandboxFactory(binary="docker", workdir_root=tmp_path)
+
+    with pytest.raises(SandboxUnavailableError, match="deprecated and removed by Docker"):
+        await factory.create()
+
+
 async def test_create_raises_on_nonzero_exit_from_run_subcommand(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:

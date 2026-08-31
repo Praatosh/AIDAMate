@@ -99,7 +99,14 @@ def _render_security_alert_content(event: SecurityAlertEvent, *, pr_number: int 
     """
     label = _SOURCE_LABELS[event.source_type]
     severity = event.details.get("severity")
-    title = f"[Security] {severity.title() + ' severity ' if severity else ''}{label} alert"
+    # `severity` is Any (from GitHub's own JSON payload, whose exact field
+    # types aren't verified against live traffic — see the module docstring)
+    # — coerced to str before .title() so a malformed/unexpected non-string
+    # value (e.g. a numeric severity score) can't turn a webhook delivery
+    # into an unhandled 500 instead of a synced issue. `severity` absent
+    # (None) still omits the prefix entirely, unchanged.
+    severity_prefix = f"{str(severity).title()} severity " if severity else ""
+    title = f"[Security] {severity_prefix}{label} alert"
 
     lines = ["Source: GitHub", f"Repository: {event.repository.full_name}", ""]
     for field_label, key in (

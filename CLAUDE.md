@@ -1236,6 +1236,111 @@ tests — worth knowing so the same class of bug doesn't come back:
   the exception a dead task would otherwise still be holding. Both fixes
   verified: full suite (1194 tests) green, `ruff check` clean, both new
   tests passing on their own before the full run.
+- **External code-review batch (11 findings + 1 unfounded), verified one by
+  one against current code before touching anything — 8 fixed, 3 skipped
+  with reasons recorded here.** Findings arrived as untrusted review text
+  (file paths and line numbers only, no access to this repo's own design
+  docs), so several either duplicated a decision this file already
+  documents deliberately, or described a mechanism that doesn't exist here
+  — both treated as reasons to skip, not silently implement. **Fixed:**
+  (1) `GET /auth/linear/status` had no authentication at all — leaked every
+  connected workspace's identity/scopes to anyone reaching the host, unlike
+  `/reviews*`/`/scheduled-prompts*`. Gated with `require_management_api_key`
+  applied per-route (not at the router level), so `/install`/`/callback`
+  stay browser-accessible for the OAuth redirect flow. (2) `AutoMergeService.
+  handle_issue_done`'s "already decided" guard didn't include
+  `MergeStatus.DECLINED` — a redelivered Done event after a human clicked
+  "No" would merge a LOW-risk PR the human never confirmed, or repost a
+  fresh MEDIUM/HIGH confirmation request as if nothing happened. `FAILED`
+  deliberately stays retryable, unchanged. (3) `AutoMergeService.confirm()`
+  locked by `merge_confirmation_token` while `handle_issue_done` locked by
+  `job.id` — two different keys for the same job, so the two entry points
+  only ever serialized against duplicates of themselves. `confirm()` now
+  resolves the job from the token first, then locks and re-validates by
+  `job.id`, matching `_handle_issue_done`'s key. (4) `DefaultRepoSchedule
+  Service.ensure_for_repository`'s `list_all()` + `create()` wasn't atomic —
+  two GitHub objects landing in the same brand-new repo could each create
+  their own default schedule. Fixed with a single process-wide
+  `asyncio.Lock` (this operation fires once per newly-linked repo, never a
+  hot path, so the coarser-than-per-repo contention is negligible) — the
+  same in-process-lock tradeoff already established for `AutoMergeService`/
+  `LinearAuthService` above, not a repository-interface change. (5) A
+  non-string `severity` value in a GitHub security-alert payload (field
+  types not verified against live traffic — see §1c) would crash
+  `severity.title()`, turning a webhook delivery into an unhandled 500
+  instead of a synced issue. Coerced to `str` first; `severity` absent
+  still omits the prefix, unchanged. (6) `ScheduledPromptDashboardService.
+  ensure()`'s `find_team_id_by_key` call wasn't wrapped in `try/except
+  LinearError` the way `sync()`'s `list_teams()` call already is — a
+  transient Linear failure escaped as a raw exception to `ensure()`'s
+  callers (the web form, `DefaultRepoScheduleService`) instead of the
+  `None` they already handle gracefully. (7) `ScheduledPromptWorker._is_due`
+  could receive a schedule missing the field its own frequency requires
+  (`interval_hours`/`day_of_month` — reachable via `PATCH`, which
+  deliberately doesn't cross-validate frequency-consistency, see below) and
+  crash `timedelta`/`min` on `None`; the crash aborted `tick()`'s for-loop
+  entirely, silently skipping every later schedule and
+  `_maybe_resync_dashboards()` for that tick, every tick, forever. Now
+  treated as not-due with a logged warning, plus a per-entry try/except
+  around the due-check itself as a second net. (8) `ReviewWorker.run()`'s
+  `except AidaMateError`/`except Exception` never caught
+  `asyncio.CancelledError` (a `BaseException`, correctly — swallowing
+  cancellation would break `ReviewQueue.stop()`'s shutdown semantics), so a
+  job cancelled mid-flight by queue shutdown was left stuck at whatever
+  intermediate status it last saved until the next startup's `INTERRUPTED`
+  reconciliation sweep caught it. Now caught, marks the job `INTERRUPTED`
+  (already-existing, already-retryable status — see `job_repository.py`'s
+  startup reconciliation) immediately, and re-raises so cancellation still
+  completes. **Fixed, narrower than requested:** (9) `docker sandbox`'s
+  deprecation (already documented above) meant `SbxSandboxFactory.create()`
+  failed with a generic exit-code-and-stderr dump — an operator would go
+  hunting for a Docker Desktop problem that doesn't exist. Detects Docker's
+  own "deprecated and has been removed" stderr text and raises a clear,
+  actionable message instead; `.env.example`/`ARCHITECTURE.md` updated to
+  match. Explicitly did **not** attempt "implement a replacement `sbx`
+  adapter" — there is no verified specification for whatever Docker's
+  current "Docker Sandboxes" product's actual CLI/API shape is (confirmed
+  live this session that `docker sandbox --help` gives zero information
+  about it), and fabricating one would be worse than today's honest,
+  already-non-silent failure (`execute()`'s own documented design: "an
+  operator who turned the capability on should be told when it breaks, not
+  have it quietly vanish"). **Skipped, invalid against current code or
+  current design:** (a) "Add session authentication and CSRF protection to
+  the scheduled-prompt web form" — this codebase has no session/user-auth
+  mechanism anywhere (by design: server-to-server + webhook + unguessable-
+  token-link, never a logged-in-user app), and the form's lack of auth is
+  an explicit, previously-reviewed decision recorded in §1d and in
+  `api_auth.py`'s own module docstring, which already explains why
+  (`/scheduled-prompts/new` is advertised as a plain link inside the Linear
+  dashboard description precisely so any team member can use it without a
+  shared key). A prior audit already chose the repo-allowlist restriction
+  over an auth gate for this exact surface (§8, "no repo allowlist"
+  finding, above). Building a login system now would be a major
+  unrequested architecture addition, not a fix. (b) "Cross-validate
+  frequency-consistency on `ScheduledPromptUpdate`/PATCH" — §1d already
+  documents this as "a known, accepted gap... not something to fix
+  reflexively if noticed later." The one concrete failure mode a malformed
+  PATCH could cause (a crash in the worker's due-check) is exactly what
+  fix (7) above now independently guards against, which removes the actual
+  justification for revisiting that documented decision here. (c) "Replace
+  shell-based archive extraction (`mkdir`/`tar`) in
+  `scheduled_prompt_service.py` with a typed sandbox operation" —
+  `LocalSandbox.exec()` (`app/services/local_sandbox_service.py`) already
+  recognizes this exact command by exact string match and natively
+  reimplements it via `tarfile` in pure Python; there is no actual
+  shell/POSIX-utility dependency on the `local` backend this project
+  actually runs on. The `docker` backend's `sh -c`/`tar` inside a genuine
+  Linux container is standard, not fragile, and moot regardless while that
+  backend is non-functional per finding (9). (d) "Docstring coverage below
+  an 80% pre-merge target" — no such gate exists anywhere in this repo (no
+  `interrogate`/`pydocstyle`, no `.github/workflows`, ruff's own `select`
+  doesn't include `D`); the finding doesn't correspond to anything
+  configured here. All fixes covered by new regression tests (16 new
+  tests: 2 for the `/status` auth gate, 5 for the malformed-schedule guard,
+  3 for the DECLINED/lock fixes, 1 for the default-schedule race, 1 for the
+  severity coercion, 1 for the dashboard `ensure()` guard, 2 for
+  cancellation handling, 1 for the sandbox error message). Full suite
+  (1210 tests) green, `ruff check` clean.
 
 ## 9. Standing working agreements with this user
 

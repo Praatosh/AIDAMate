@@ -7,6 +7,8 @@ Linear token store, matching `test_scheduled_prompt_dashboard_service.py`'s
 style.
 """
 
+import asyncio
+
 from app.models.linear import LinearInstallation
 from app.models.scheduled_prompt import ScheduledPrompt
 from app.models.scheduled_prompt_dashboard import ScheduledPromptDashboard
@@ -102,6 +104,38 @@ async def test_noop_when_there_is_no_default_installation() -> None:
 
     assert await repository.list_all() == []
     assert dashboard_service.ensured == []
+
+
+class SlowFakeDashboardService(FakeDashboardService):
+    """Like `FakeDashboardService`, but yields control inside `ensure()` so a
+    concurrent `ensure_for_repository` call gets a real chance to interleave
+    — proving the lock actually serializes rather than merely happening not
+    to overlap in this event loop's scheduling."""
+
+    async def ensure(self, organization_id: str) -> ScheduledPromptDashboard | None:
+        await asyncio.sleep(0)
+        return await super().ensure(organization_id)
+
+
+async def test_concurrent_calls_create_exactly_one_default_schedule() -> None:
+    """Regression: `list_all()` + `create()` was not atomic — two GitHub
+    objects in the same brand-new repo, each triggering their own concurrent
+    `ensure_for_repository` call, could both observe no existing schedule
+    and both create one."""
+    repository = InMemoryScheduledPromptRepository()
+    dashboard = ScheduledPromptDashboard(
+        organization_id="org-1", team_id="team-1", linear_issue_id="issue-dash-1"
+    )
+    dashboard_service = SlowFakeDashboardService(dashboard)
+    service = DefaultRepoScheduleService(repository, dashboard_service, FakeTokenStore(_installation()))
+
+    await asyncio.gather(
+        service.ensure_for_repository("acme/api"),
+        service.ensure_for_repository("acme/api"),
+    )
+
+    created = await repository.list_all()
+    assert len(created) == 1
 
 
 async def test_noop_when_the_dashboard_cannot_be_resolved() -> None:

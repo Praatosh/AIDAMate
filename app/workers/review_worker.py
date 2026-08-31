@@ -109,6 +109,20 @@ class ReviewWorker:
 
         try:
             await self._executor.execute(job)
+        except asyncio.CancelledError:
+            # Queue shutdown (`ReviewQueue.stop()`) cancels every in-flight
+            # worker task. `mark_status`/`mark_failed` are never reached in
+            # that case, leaving the job stuck at whatever intermediate
+            # status it last saved (e.g. ANALYZING) until the next startup's
+            # `mark_stale_jobs_interrupted` reconciliation sweep catches it —
+            # correct eventually, but stuck-looking in the meantime. Recording
+            # INTERRUPTED here immediately makes it visible to the retry path
+            # right away. Must re-raise (never swallow a CancelledError) so
+            # the task's own cancellation completes and `stop()`'s
+            # `asyncio.gather(..., return_exceptions=True)` unwinds cleanly.
+            job.mark_interrupted()
+            await self._repository.save(job)
+            raise
         except AidaMateError as exc:
             await self._fail(job, exc.code, exc.user_message)
             return

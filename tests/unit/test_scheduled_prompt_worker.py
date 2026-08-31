@@ -112,6 +112,22 @@ def test_hourly_due_once_the_interval_elapses() -> None:
     assert _is_due(scheduled, now) is True
 
 
+def test_hourly_with_no_interval_hours_is_not_due() -> None:
+    """Regression: PATCH can leave frequency='hourly' with interval_hours=None
+    (it deliberately doesn't cross-validate) — must not crash `timedelta`."""
+    now = datetime(2026, 8, 24, 9, 17, tzinfo=ZoneInfo("Asia/Kolkata"))
+    scheduled = _scheduled(frequency="hourly", interval_hours=None, run_at_time=None)
+
+    assert _is_due(scheduled, now) is False
+
+
+def test_hourly_with_zero_interval_hours_is_not_due() -> None:
+    now = datetime(2026, 8, 24, 9, 17, tzinfo=ZoneInfo("Asia/Kolkata"))
+    scheduled = _scheduled(frequency="hourly", interval_hours=0, run_at_time=None)
+
+    assert _is_due(scheduled, now) is False
+
+
 # --- _is_due: daily ---------------------------------------------------------------
 
 
@@ -230,6 +246,24 @@ def test_monthly_due_again_next_month() -> None:
     assert _is_due(scheduled, now) is True
 
 
+def test_monthly_with_no_day_of_month_is_not_due() -> None:
+    """Regression: PATCH can leave frequency='monthly' with day_of_month=None
+    — must not crash `_effective_day_of_month`'s `min()` call."""
+    now = datetime(2026, 8, 15, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    scheduled = _scheduled(frequency="monthly", day_of_month=None, run_at_time="09:00")
+
+    assert _is_due(scheduled, now) is False
+
+
+def test_weekly_with_no_day_of_week_is_not_due() -> None:
+    """Same PATCH-leniency gap, for weekly — day_of_week=None must not match
+    any weekday rather than being compared and (harmlessly) never firing."""
+    now = datetime(2026, 8, 24, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))  # a Monday
+    scheduled = _scheduled(frequency="weekly", day_of_week=None, run_at_time="09:00")
+
+    assert _is_due(scheduled, now) is False
+
+
 # --- tick(): due-detection across timezones -------------------------------------
 
 
@@ -290,6 +324,29 @@ async def test_tick_skips_a_schedule_with_an_invalid_timezone(monkeypatch: pytes
     await worker.tick()  # must not raise
 
     assert service.runs == []
+
+
+async def test_tick_skips_a_malformed_hourly_schedule_without_blocking_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: before `_is_due` guarded this, a malformed row here would
+    raise, aborting `tick()`'s for-loop entirely — every schedule after it in
+    `list_all()`'s order (and `_maybe_resync_dashboards()`) would silently
+    never run, every tick, forever."""
+    fixed_now = datetime(2026, 8, 24, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    monkeypatch.setattr("app.workers.scheduled_prompt_worker.datetime", _FixedDatetime(fixed_now))
+
+    repo = InMemoryScheduledPromptRepository()
+    malformed = _scheduled(frequency="hourly", interval_hours=None, run_at_time=None)
+    malformed.interval_hours = None  # bypass model validation to simulate PATCH-corrupted state
+    await repo.create(malformed)
+    healthy = await repo.create(_scheduled(run_at_time="09:00", timezone="Asia/Kolkata"))
+    service = FakeService()
+    worker = ScheduledPromptWorker(repo, service)
+
+    await worker.tick()  # must not raise
+
+    assert service.runs == [healthy.id]
 
 
 async def test_tick_marks_the_schedule_run_before_calling_service(monkeypatch: pytest.MonkeyPatch) -> None:
