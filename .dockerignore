@@ -1,0 +1,22 @@
+# Never bake secrets or local state into the image.
+.env
+.env.*
+!.env.example
+.local/
+*.log
+
+# Host-specific / not needed inside the image.
+.venv/
+.git/
+.gitignore
+.pytest_cache/
+__pycache__/
+*.pyc
+.claude/
+
+# Not part of the runtime image — README.md is the one exception, needed by
+# the hatchling build backend (see Dockerfile).
+tests/
+skills/
+*.md
+!README.md

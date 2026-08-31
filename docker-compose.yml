@@ -1,0 +1,31 @@
+# Portable local/self-hosted run. `docker compose up --build` works
+# identically on any machine with Docker installed — no host-specific setup.
+#
+# Secrets come from .env (git-ignored, never baked into the image — see
+# .dockerignore). REVIEW_STORE_PATH and LINEAR_TOKEN_STORE_PATH are pinned to
+# the named volume below so review history and Linear OAuth installations
+# survive a rebuild, a redeploy, or moving to a different host.
+services:
+  aida-mate:
+    build: .
+    container_name: aida-mate
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # SANDBOX_MODE=local runs entirely in pure Python (tarfile + stdlib) —
+      # no Docker socket needs to be mounted into this container to run it,
+      # unlike SANDBOX_MODE=docker's `docker sandbox` CLI, which would need
+      # nested access to a Docker daemon (a real security trade-off, not
+      # something to reach for casually). Override to `docker` only on a
+      # host where that access has been deliberately set up and reviewed.
+      SANDBOX_MODE: local
+      REVIEW_STORE_PATH: /data/reviews.sqlite3
+      LINEAR_TOKEN_STORE_PATH: /data/linear_tokens.json
+    volumes:
+      - aida-mate-data:/data
+    restart: unless-stopped
+
+volumes:
+  aida-mate-data:
