@@ -32,6 +32,19 @@ omits the flag in the common case (every caller in this codebase calls
 `exec()` with `cwd=None`) rather than trying to compute the in-container
 path itself.
 
+**Minimum supported `sbx` version: v0.33.0.** Verified against Docker's own
+published changelog (https://github.com/docker/sbx-releases/releases/tag/v0.33.0,
+not just this session's live testing on a newer install): "`sbx exec` now
+uses the same working directory as `sbx run`" — meaning the `cwd=None`
+behavior this module relies on is not guaranteed on an older `sbx`. This
+machine's installed version (v0.38.0, confirmed via `sbx version`) already
+satisfies it, so it wasn't reproducible as a live failure here. Not
+enforced at runtime (no `sbx version` probe/semver check) — that would add
+a subprocess call and parsing logic to every sandbox creation for a
+condition this codebase has no way to have hit yet; documented instead as
+the concrete minimum to check first if `exec()` ever appears to run in the
+wrong directory on some other host.
+
 The workspace directory is created empty per sandbox and holds only whatever
 this service writes into it (the downloaded PR archive) — AIDA-MATE never
 mounts a real project directory from this host.
@@ -245,10 +258,22 @@ class SbxSandboxFactory:
         )
 
         argv = [self._binary, "create", "shell", str(workspace), "--name", name]
-        process = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await process.communicate()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            _stdout, stderr = await process.communicate()
+        except OSError as exc:
+            # The `shutil.which` check above narrows this (the binary
+            # disappearing between that check and this call, a permissions
+            # problem, etc.) but doesn't eliminate it — same class of
+            # failure `destroy()` already guards against for `sbx rm`. Without
+            # this, the mkdtemp'd workspace directory would leak on every
+            # such failure, and a raw OSError would reach callers expecting
+            # the domain-specific SandboxUnavailableError this method
+            # otherwise always raises on failure.
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise SandboxUnavailableError(f"Could not launch '{self._binary} create': {exc}") from exc
 
         if process.returncode != 0:
             shutil.rmtree(workspace, ignore_errors=True)

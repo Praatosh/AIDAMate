@@ -139,6 +139,29 @@ async def test_failed_create_cleans_up_the_workspace_directory(
     assert list(tmp_path.iterdir()) == []
 
 
+async def test_create_raises_sandbox_unavailable_when_the_subprocess_fails_to_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Regression: `shutil.which` narrows but doesn't eliminate the binary
+    failing to launch (removed between the check and this call, a
+    permissions problem, etc.) — must raise the domain-specific
+    SandboxUnavailableError (chained from the OSError), not let the raw
+    OSError escape, and must not leak the mkdtemp'd workspace directory."""
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/sbx")
+
+    async def raise_oserror(*a, **k):
+        raise OSError("sbx not found")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", raise_oserror)
+    factory = SbxSandboxFactory(binary="sbx", workdir_root=tmp_path)
+
+    with pytest.raises(SandboxUnavailableError) as exc_info:
+        await factory.create()
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    assert list(tmp_path.iterdir()) == []
+
+
 # --- upload_bytes / read_file (direct workspace I/O, no subprocess) ----------
 
 

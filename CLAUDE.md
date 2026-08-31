@@ -1389,6 +1389,30 @@ tests — worth knowing so the same class of bug doesn't come back:
   message only ever came from the old plugin's stderr and can no longer
   occur — all replaced; net two fewer tests, same coverage per current
   behavior). Full suite (1208 tests) green, `ruff check` clean.
+- **`sbx` migration follow-up, 3 real fixes + 1 no-op reorder.** A later
+  finding claimed "Docker Sandbox v0.33.0" as the minimum version the
+  adapter's `cwd=None` default-workdir behavior needs — checked this
+  against Docker's actual published changelog
+  (github.com/docker/sbx-releases, not just this session's own live test on
+  a newer install) rather than trusting the number: confirmed true —
+  v0.33.0's release notes read "`sbx exec` now uses the same working
+  directory as `sbx run`." Documented as the minimum in the module
+  docstring rather than enforced at runtime (a `sbx version` probe/semver
+  check on every sandbox creation for a condition never actually
+  reproduced here isn't proportionate). Also fixed: `SbxSandboxFactory.
+  create()`'s `asyncio.create_subprocess_exec` call for `sbx create` had no
+  `except OSError` the way `destroy()`'s equivalent call for `sbx rm`
+  already does — a launch failure there (binary removed between the
+  `shutil.which` check and this call, a permissions problem) leaked the
+  already-`mkdtemp`'d workspace directory and let a raw `OSError` escape
+  instead of the `SandboxUnavailableError` this method otherwise always
+  raises on failure. Fixed the same way `destroy()` already does it, now
+  chaining the original exception. Renamed the unused `stdout` from that
+  same `communicate()` call to `_stdout`, matching `destroy()`'s own `_,
+  stderr = ...` convention for the identical pattern. `.env.example`'s
+  `SANDBOX_BINARY`/`SANDBOX_MODE` reordered per the finding — purely
+  cosmetic, no functional effect either order. New regression test for the
+  OSError path. Full suite (1209 tests) green, `ruff check` clean.
 
 ## 9. Standing working agreements with this user
 
